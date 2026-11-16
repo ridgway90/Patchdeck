@@ -9,7 +9,7 @@ import time
 
 import asyncssh
 
-APT_FAMILY = {"debian", "ubuntu", "devuan"}
+APT_FAMILY = {"debian", "ubuntu", "devuan", "raspbian", "linuxmint", "pop", "kali"}
 APK_FAMILY = {"alpine"}
 
 # Lists pending updates. Prints __UPDATE_FAILED__ if the package index could not be refreshed.
@@ -124,11 +124,23 @@ class Host:
                 cfg[k.strip()] = v.strip()
         return cfg
 
+    @staticmethod
+    def _entry(g, kind):
+        return {"vmid": int(g["vmid"]), "type": kind, "name": g.get("name") or str(g["vmid"]),
+                "status": g.get("status"), "os": None, "packages": [], "reboot": False,
+                "error": None, "warning": None, "checked_at": time.time()}
+
+    @staticmethod
+    def _fill(entry, fam, out):
+        listing, _, reboot = out.partition("__REBOOT__")
+        entry["packages"] = parse_packages(fam, listing)
+        entry["reboot"] = reboot.strip() == "yes"
+        if "__UPDATE_FAILED__" in listing:
+            entry["warning"] = "Could not refresh package lists"
+
     async def _check_ct(self, conn, ct):
-        vmid = int(ct["vmid"])
-        entry = {"vmid": vmid, "name": ct.get("name") or str(vmid), "status": ct.get("status"),
-                 "os": None, "packages": [], "reboot": False, "error": None, "warning": None,
-                 "checked_at": time.time()}
+        entry = self._entry(ct, "lxc")
+        vmid = entry["vmid"]
         try:
             cfg = await self._ct_config(conn, vmid)
             entry["os"] = cfg.get("ostype")
@@ -140,44 +152,85 @@ class Host:
                 entry["error"] = f"Unsupported OS type: {entry['os']}"
                 return entry
             listing_cmd = APT_LIST if fam == "apt" else APK_LIST
-            out = await self._run(conn, ct_cmd(vmid, f"{listing_cmd}; echo __REBOOT__; {CT_REBOOT}"))
-            listing, _, reboot = out.partition("__REBOOT__")
-            entry["packages"] = parse_packages(fam, listing)
-            entry["reboot"] = reboot.strip() == "yes"
-            if "__UPDATE_FAILED__" in listing:
-                entry["warning"] = "Could not refresh package lists"
+            self._fill(entry, fam, await self._run(conn, ct_cmd(vmid, f"{listing_cmd}; echo __REBOOT__; {CT_REBOOT}")))
         except Exception as e:  # one broken container should not fail the whole host
             entry["error"] = str(e)
         return entry
 
+    # VMs are reached through the QEMU guest agent (qm guest exec), so they need
+    # qemu-guest-agent installed and the agent option enabled on the VM.
+
+    async def _guest_exec(self, conn, vmid, inner, timeout=180):
+        out = await self._run(conn, f"qm guest exec {int(vmid)} --timeout {timeout} -- sh -c {shlex.quote(inner)}",
+                              timeout=timeout + 30)
+        d = json.loads(out)
+        if not d.get("exited"):
+            raise RuntimeError("Command inside the VM did not finish in time")
+        return int(d.get("exitcode", 1)), d.get("out-data", ""), d.get("err-data", "")
+
+    async def _agent_ok(self, conn, vmid):
+        r = await conn.run(f"qm guest cmd {int(vmid)} ping", check=False, timeout=25)
+        return r.exit_status == 0
+
+    async def _check_vm(self, conn, vm):
+        entry = self._entry(vm, "vm")
+        vmid = entry["vmid"]
+        if entry["status"] != "running":
+            return entry
+        try:
+            if not await self._agent_ok(conn, vmid):
+                entry["error"] = "Guest agent not responding: install qemu-guest-agent in the VM and enable it in the VM's Options"
+                return entry
+            info = json.loads(await self._run(conn, f"qm guest cmd {vmid} get-osinfo", timeout=25))
+            entry["os"] = info.get("id") or "unknown"
+            fam = family(entry["os"])
+            if not fam:
+                entry["error"] = f"Unsupported OS: {info.get('pretty-name') or entry['os']}"
+                return entry
+            listing_cmd = APT_LIST if fam == "apt" else APK_LIST
+            _, out, _ = await self._guest_exec(conn, vmid, f"{listing_cmd}; echo __REBOOT__; {CT_REBOOT}")
+            self._fill(entry, fam, out)
+        except Exception as e:
+            entry["error"] = str(e)
+        return entry
+
+    async def _guests(self, conn):
+        node = (await self._run(conn, "hostname", timeout=15)).strip()
+        q = shlex.quote(node)
+        lxc = json.loads(await self._run(conn, f"pvesh get /nodes/{q}/lxc --output-format json", timeout=60))
+        qemu = json.loads(await self._run(conn, f"pvesh get /nodes/{q}/qemu --output-format json", timeout=60))
+        qemu = [v for v in qemu if not v.get("template")]
+        return node, [(g, "lxc") for g in lxc] + [(g, "vm") for g in qemu]
+
+    async def _check_guest(self, conn, g, kind):
+        return await (self._check_ct(conn, g) if kind == "lxc" else self._check_vm(conn, g))
+
     async def check(self, exclude=()):
-        """Full check: host packages plus every LXC on the node."""
+        """Full check: host packages plus every LXC and VM on the node."""
         async with self._connect() as conn:
-            node = (await self._run(conn, "hostname", timeout=15)).strip()
-            host_info = await self._check_self(conn)
             if self.kind != "pve":
-                return {"node": node, "host": host_info, "containers": [],
+                node = (await self._run(conn, "hostname", timeout=15)).strip()
+                return {"node": node, "host": await self._check_self(conn), "containers": [],
                         "checked_at": time.time(), "error": None}
-            raw = await self._run(conn, f"pvesh get /nodes/{shlex.quote(node)}/lxc --output-format json", timeout=60)
-            lxcs = sorted(json.loads(raw), key=lambda c: int(c["vmid"]))
+            host_info = await self._check_self(conn)
+            node, guests = await self._guests(conn)
             sem = asyncio.Semaphore(4)
 
-            async def one(ct):
+            async def one(g, kind):
                 async with sem:
-                    return await self._check_ct(conn, ct)
+                    return await self._check_guest(conn, g, kind)
 
-            cts = await asyncio.gather(*(one(c) for c in lxcs if int(c["vmid"]) not in exclude))
-        return {"node": node, "host": host_info, "containers": list(cts),
+            results = await asyncio.gather(*(one(g, k) for g, k in guests if int(g["vmid"]) not in exclude))
+        return {"node": node, "host": host_info, "containers": sorted(results, key=lambda e: e["vmid"]),
                 "checked_at": time.time(), "error": None}
 
-    async def check_container(self, vmid):
+    async def check_guest(self, vmid):
         async with self._connect() as conn:
-            node = (await self._run(conn, "hostname", timeout=15)).strip()
-            raw = await self._run(conn, f"pvesh get /nodes/{shlex.quote(node)}/lxc --output-format json", timeout=60)
-            ct = next((c for c in json.loads(raw) if int(c["vmid"]) == int(vmid)), None)
-            if ct is None:
-                raise RuntimeError(f"Container {vmid} no longer exists")
-            return await self._check_ct(conn, ct)
+            _, guests = await self._guests(conn)
+            match = next(((g, k) for g, k in guests if int(g["vmid"]) == int(vmid)), None)
+            if match is None:
+                raise RuntimeError(f"Guest {vmid} no longer exists")
+            return await self._check_guest(conn, *match)
 
     async def check_self(self):
         async with self._connect() as conn:
@@ -215,22 +268,94 @@ class Host:
                                f"the host; its output is in {log}. Run a check again in a few minutes.")
         return rc
 
+    async def run_vm(self, vmid, inner, on_line, max_hours=4):
+        """Run a command inside a VM through the guest agent and follow its log.
+
+        The command is started with systemd-run (or setsid when there's no systemd) so it isn't
+        killed if the upgrade restarts qemu-guest-agent itself, then the log is polled.
+        """
+        tag = secrets.token_hex(6)
+        log = f"/var/tmp/patchdeck-{tag}.log"
+        body = f"( {inner} ) >> {log} 2>&1; echo {RC_MARK}$? >> {log}"
+        start = (f": > {log}; if command -v systemd-run >/dev/null 2>&1; then "
+                 f"systemd-run --unit=patchdeck-{tag} --collect --quiet sh -c {shlex.quote(body)}; "
+                 f"else setsid nohup sh -c {shlex.quote(body)} >/dev/null 2>&1 < /dev/null & fi")
+        conn = await self._connect()
+        try:
+            rc, out, err = await self._guest_exec(conn, vmid, start, 60)
+            if rc != 0:
+                raise RuntimeError(f"Could not start the update in the VM: {(err or out).strip()}")
+            offset, buf, fails, deadline = 0, "", 0, time.time() + max_hours * 3600
+            while time.time() < deadline:
+                await asyncio.sleep(3)
+                try:
+                    if conn is None:
+                        conn = await self._connect()
+                    _, out, _ = await self._guest_exec(conn, vmid, f"tail -c +{offset + 1} {log}", 60)
+                    fails = 0
+                except Exception:
+                    fails += 1  # the agent restarts while it upgrades itself; keep trying for a while
+                    if conn is not None:
+                        conn.close()
+                        conn = None
+                    if fails > 40:
+                        raise RuntimeError(f"Lost contact with the VM's guest agent; the update may still be running. Log: {log}")
+                    continue
+                offset += len(out.encode())
+                buf += out
+                *lines, buf = buf.split("\n")
+                for line in lines:
+                    if line.startswith(RC_MARK):
+                        try:
+                            await self._guest_exec(conn, vmid, f"rm -f {log}", 30)
+                        except Exception:
+                            pass
+                        return int(line[len(RC_MARK):] or 1)
+                    on_line(line)
+            raise RuntimeError(f"The update in the VM is still running after {max_hours} hours. Log: {log}")
+        finally:
+            if conn is not None:
+                conn.close()
+
+    async def reboot_guest(self, vmid, kind, on_line, wait=300):
+        tool = "pct" if kind == "lxc" else "qm"
+        async with self._connect() as conn:
+            await self._run(conn, f"{tool} reboot {int(vmid)} --timeout 300", timeout=420)
+            on_line("Reboot command sent, waiting for it to come back…")
+            end = time.time() + wait
+            while time.time() < end:
+                await asyncio.sleep(5)
+                status = await conn.run(f"{tool} status {int(vmid)}", check=False, timeout=30)
+                if "running" not in (status.stdout or ""):
+                    continue
+                if kind == "lxc" or await self._agent_ok(conn, vmid):
+                    on_line("Back up.")
+                    return True
+        on_line("Still not back after 5 minutes; check it in Proxmox.")
+        return False
+
+    async def reboot_self(self):
+        async with self._connect() as conn:
+            await self._run(conn, "shutdown -r +1 'Patchdeck: rebooting after updates'", timeout=30)
+
     def upgrade_cmd(self, vmid=None, fam="apt"):
         if vmid is None:
             return APT_UPGRADE
         return ct_cmd(vmid, APT_UPGRADE if fam == "apt" else APK_UPGRADE)
 
-    async def snapshot(self, vmid):
+    async def snapshot(self, vmid, kind="lxc"):
+        tool = "pct" if kind == "lxc" else "qm"
         name = time.strftime("pre-update-%Y%m%d-%H%M%S")
         async with self._connect() as conn:
-            await self._run(conn, f"pct snapshot {int(vmid)} {name} --description 'Taken by patchdeck before updating'", timeout=600)
+            await self._run(conn, f"{tool} snapshot {int(vmid)} {name} --description 'Taken by patchdeck before updating'", timeout=900)
         return name
 
-    async def prune_snapshots(self, vmid, keep):
+    async def prune_snapshots(self, vmid, keep, kind="lxc"):
+        tool = "pct" if kind == "lxc" else "qm"
         async with self._connect() as conn:
-            out = await self._run(conn, f"pct listsnapshot {int(vmid)}", timeout=60)
+            out = await self._run(conn, f"{tool} listsnapshot {int(vmid)}", timeout=60)
             names = sorted(set(SNAP_NAME.findall(out)))
             removed = names[:-keep] if keep > 0 else names
             for n in removed:
-                await self._run(conn, f"pct delsnapshot {int(vmid)} {n}", timeout=600)
+                await self._run(conn, f"{tool} delsnapshot {int(vmid)} {n}", timeout=900)
         return removed

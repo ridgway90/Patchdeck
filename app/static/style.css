@@ -298,3 +298,44 @@ form.inline input { flex: 1 1 200px; max-width: 320px; }
 .targets .check { font-size: 13.5px; }
 .window-row { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; }
 .window-row .field { flex: 0 1 140px; }
+
+/* ---------- update dialog ---------- */
+.modal {
+  border: 1px solid var(--border); border-radius: 12px; padding: 0; width: min(480px, calc(100vw - 32px));
+  background: var(--surface); color: var(--text); box-shadow: 0 20px 50px rgba(0, 0, 0, .25);
+}
+.modal::backdrop { background: rgba(10, 14, 20, .45); }
+.modal form { display: grid; gap: 12px; padding: 20px; }
+.modal h2 { font-size: 17px; }
+.modal #upd-sub { margin: -6px 0 2px; font-size: 13px; }
+.choices { display: grid; gap: 8px; }
+.choice {
+  display: grid; grid-template-columns: 18px 1fr; gap: 10px; align-items: start; cursor: pointer;
+  border: 1px solid var(--border); border-radius: 9px; padding: 10px 12px;
+}
+.choice:has(input:checked) { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 7%, transparent); }
+.choice:has(input:disabled) { opacity: .6; cursor: default; }
+.choice input { accent-color: var(--accent); margin-top: 3px; outline: none; }
+.choice:has(input:focus-visible) { outline: 2px solid color-mix(in srgb, var(--accent) 45%, transparent); }
+.choice select { max-width: 100%; }
+.choice > span { display: grid; gap: 6px; min-width: 0; }
+.choice small { color: var(--muted); font-size: 12.5px; }
+.choice small:empty { display: none; }
+.warn-box { margin: 0; font-size: 13px; padding: 9px 12px; border-radius: 8px; background: var(--warn-bg); color: var(--warn); }
+.modal-actions { display: flex; gap: 8px; align-items: center; margin-top: 4px; }
+.modal-actions .spacer { flex: 1; }
+.pill.sched-tag { background: var(--info-bg); color: var(--info); font-weight: 550; }
+
+/* ---------- maintenance settings ---------- */
+.windows { display: grid; gap: 10px; }
+.win-card { border: 1px solid var(--border); border-radius: 9px; padding: 12px 14px; display: grid; gap: 10px; }
+.win-card .fields { align-items: end; }
+.win-card .field.grow { flex: 2 1 180px; }
+.sched-table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+.sched-table th { text-align: left; font-size: 12px; color: var(--muted); font-weight: 600; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+.sched-table td { padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+.sched-table tr.grp td { background: var(--surface-2); font-weight: 600; font-size: 12.5px; }
+.sched-table select { padding: 4px 8px; font-size: 13px; }
+.sched-table td.c { text-align: center; }
+.sched-table input[type=checkbox] { accent-color: var(--accent); width: 16px; height: 16px; }
+.table-wrap { overflow-x: auto; }

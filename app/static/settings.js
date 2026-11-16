@@ -172,39 +172,66 @@ function scheduleSection() {
     <div class="form-actions"><button class="btn primary small" data-act="save-schedule">Save schedule</button></div>`;
 }
 
-function maintenanceSection() {
-  const m = S.maintenance;
-  const fmt = (ts, opts) => new Date(ts * 1000).toLocaleString([], opts);
-  const next = m.enabled && m.next_start
-    ? `${fmt(m.next_start, { weekday: "short", hour: "2-digit", minute: "2-digit" })} – ${fmt(m.next_end, { hour: "2-digit", minute: "2-digit" })}`
-    : "off";
-  const only = new Set(S.maintenance_only);
-  const box = (key, label) => `<label class="check"><input type="checkbox" name="only" value="${esc(key)}" ${only.has(key) ? "checked" : ""}> ${esc(label)}</label>`;
-  const groups = S.targets.map((t) => `
-    <div class="group"><strong>${esc(t.host)}</strong>
-      <div class="opts">
-        ${box(`${t.host}/host`, t.kind === "pve" ? "The Proxmox host itself" : "This server")}
-        ${t.containers.map((c) => box(`${t.host}/${c.vmid}`, `${c.name} (${c.vmid})`)).join("")}
+let winDraft = null;  // unsaved maintenance window edits
+
+function windowsSection() {
+  if (!winDraft) winDraft = S.windows.map((w) => ({ was: w.name, name: w.name, days: [...w.days], start: w.start, end: w.end }));
+  const fmt = (w) => w.next_start ? `${new Date(w.next_start * 1000).toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" })}` : "never (no days selected)";
+  const next = Object.fromEntries(S.windows.map((w) => [w.name, fmt(w)]));
+  const cards = winDraft.map((w, i) => `
+    <div class="win-card" data-win="${i}">
+      <div class="fields">
+        <label class="field grow"><span>Name</span><input data-wf="name" value="${esc(w.name)}" placeholder="e.g. Weekend nights" required></label>
+        <label class="field narrow"><span>Starts</span><input type="time" data-wf="start" value="${esc(w.start)}" required></label>
+        <label class="field narrow"><span>Ends</span><input type="time" data-wf="end" value="${esc(w.end)}" required></label>
+        <button type="button" class="btn small ghost danger" data-act="win-del" data-i="${i}">Remove</button>
       </div>
+      <div class="days">${DAYS.map((d, j) => `<button type="button" class="day wday ${w.days.includes(j) ? "on" : ""}" data-wday="${j}" aria-pressed="${w.days.includes(j)}">${d}</button>`).join("")}</div>
+      ${w.was && next[w.was] ? `<p class="hint">Next: <strong>${esc(next[w.was])}</strong></p>` : ""}
     </div>`).join("");
   return `
-    <form data-form="maint">
-      <p>Click 🌙 next to any Update button to run that update in the window instead of straight away.
-        Scheduled updates run one at a time per host; anything not started by the end time waits for the next window.</p>
-      <label class="check"><input type="checkbox" name="enabled" ${m.enabled ? "checked" : ""}> Enable the maintenance window</label>
-      <div class="field"><span>Days</span>
-        <div class="days">${DAYS.map((name, i) => `<button type="button" class="day mday ${m.days.includes(i) ? "on" : ""}" data-mday="${i}" aria-pressed="${m.days.includes(i)}">${name}</button>`).join("")}</div>
-      </div>
-      <div class="window-row">
-        <label class="field"><span>Starts</span><input type="time" name="start" value="${esc(m.start)}" required></label>
-        <label class="field"><span>Ends</span><input type="time" name="end" value="${esc(m.end)}" required></label>
-      </div>
-      <p class="hint">Next window: <strong>${esc(next)}</strong> (server time). An end time earlier than the start runs past midnight.</p>
-      <div class="field"><span>Always use the window for these (their button becomes 🌙 Schedule, and Update all skips them)</span>
-        <div class="targets">${groups || `<span class="muted">Add hosts and run a check first.</span>`}</div>
-      </div>
-      <div class="form-actions"><button class="btn primary small">Save</button></div>
-    </form>`;
+    <p>Windows are the times updates are allowed to run out of hours. Give guests a window below, or pick one when you click Update.
+      Updates in a window run one at a time per host; anything not started by the end time waits for the next one. An end time before the start runs past midnight.</p>
+    <div class="windows">${cards || `<p class="muted">No windows yet.</p>`}</div>
+    <div class="form-actions">
+      <button type="button" class="btn small" data-act="win-add">+ Add window</button>
+      <button type="button" class="btn small primary" data-act="win-save">Save windows</button>
+    </div>`;
+}
+
+function collectWindows() {
+  document.querySelectorAll("#s-windows .win-card").forEach((card) => {
+    const w = winDraft[Number(card.dataset.win)];
+    card.querySelectorAll("[data-wf]").forEach((inp) => (w[inp.dataset.wf] = inp.value.trim()));
+    w.days = [...card.querySelectorAll(".wday.on")].map((x) => Number(x.dataset.wday));
+  });
+}
+
+function schedulesSection() {
+  if (!S.windows.length) return `<p class="muted">Add and save a maintenance window first.</p>`;
+  const opts = (cur) => `<option value="">No schedule</option>` + S.windows.map((w) =>
+    `<option value="${esc(w.name)}" ${cur === w.name ? "selected" : ""}>${esc(w.name)}</option>`).join("");
+  const row = (key, label) => {
+    const p = S.schedules[key] || {};
+    return `<tr data-key="${esc(key)}">
+      <td>${label}</td>
+      <td><select data-sf="window" aria-label="Window for ${esc(key)}">${opts(p.window)}</select></td>
+      <td class="c"><input type="checkbox" data-sf="auto" ${p.auto ? "checked" : ""} aria-label="Auto-update"></td>
+      <td class="c"><input type="checkbox" data-sf="reboot" ${p.reboot ? "checked" : ""} aria-label="Reboot if needed"></td>
+    </tr>`;
+  };
+  const body = S.targets.map((t) => `
+    <tr class="grp"><td colspan="4">${esc(t.host)}</td></tr>
+    ${row(`${t.host}/host`, t.kind === "pve" ? "<em>The Proxmox host itself</em>" : "<em>This server</em>")}
+    ${t.containers.map((c) => row(`${t.host}/${c.vmid}`, `${esc(c.name)} <span class="vmid">${c.vmid}</span>${c.type === "vm" ? ' <span class="kind-tag">VM</span>' : ""}`)).join("")}`).join("");
+  return `
+    <p>Give a container, VM or host a window. Its Update dialog then defaults to that window, and Update all queues it there.
+      Tick <strong>Auto</strong> to have it checked and updated in its window without you clicking anything.</p>
+    <div class="table-wrap"><table class="sched-table">
+      <thead><tr><th>Target</th><th>Window</th><th class="c">Auto</th><th class="c">Reboot if needed</th></tr></thead>
+      <tbody>${body}</tbody>
+    </table></div>
+    <div class="form-actions"><button type="button" class="btn small primary" data-act="sched-save">Save schedules</button></div>`;
 }
 
 function discordSection() {
@@ -268,7 +295,8 @@ const SECTIONS = [
   ["hosts", "Proxmox hosts", hostsSection],
   ["key", "Patchdeck SSH key", keySection],
   ["schedule", "Check schedule", scheduleSection],
-  ["maintenance", "Maintenance window", maintenanceSection],
+  ["windows", "Maintenance windows", windowsSection],
+  ["schedules", "Maintenance schedules", schedulesSection],
   ["discord", "Discord notifications", discordSection],
   ["snapshots", "Snapshots", snapshotSection],
   ["general", "General", generalSection],
@@ -290,6 +318,7 @@ function renderSettings(only) {
 async function loadSettings() {
   try {
     S = await api("/api/settings");
+    winDraft = null;
     schedDraft = { check_times: [...S.schedule.check_times], days: [...S.schedule.days] };
     renderSettings();
   } catch (e) { toast(e.message); }
@@ -308,7 +337,7 @@ $("#view-settings").addEventListener("click", async (e) => {
   const b = e.target.closest("button");
   if (!b) return;
   if (b.dataset.copy !== undefined) return copyText(b.dataset.copy);
-  if (b.dataset.mday !== undefined) {
+  if (b.dataset.wday !== undefined) {
     const on = b.classList.toggle("on");
     b.setAttribute("aria-pressed", on);
     return;
@@ -354,9 +383,40 @@ $("#view-settings").addEventListener("click", async (e) => {
     case "edit-cancel": editing.delete(host); renderSettings(["hosts"]); break;
     case "remove":
       if (!confirm(`Remove ${host} from Patchdeck? Its containers will disappear from the dashboard. Nothing changes on the host.`)) return;
-      applySettings(await act(b, "/api/hosts/delete", { name: host }, "Removing…"), ["hosts", "schedule", "maintenance"]);
+      applySettings(await act(b, "/api/hosts/delete", { name: host }, "Removing…"), ["hosts", "schedule", "schedules"]);
       refresh();
       break;
+    case "win-add":
+      collectWindows();
+      winDraft.push({ name: "", days: [5, 6], start: "02:00", end: "05:00" });
+      renderSettings(["windows"]);
+      break;
+    case "win-del": {
+      collectWindows();
+      const w = winDraft[Number(b.dataset.i)];
+      const used = w.was && Object.values(S.schedules).some((p) => p.window === w.was);
+      if (used && !confirm(`"${w.was}" is used by some schedules. Removing it clears those schedules. Continue?`)) return;
+      winDraft.splice(Number(b.dataset.i), 1);
+      renderSettings(["windows"]);
+      break;
+    }
+    case "win-save": {
+      collectWindows();
+      if (winDraft.some((w) => !w.name)) return toast("Give every window a name");
+      const r = await act(b, "/api/settings", { windows: winDraft }, "Saving…");
+      if (r) { winDraft = null; toast("Maintenance windows saved"); applySettings(r, ["windows", "schedules"]); refresh(); }
+      break;
+    }
+    case "sched-save": {
+      const schedules = {};
+      document.querySelectorAll("#s-schedules tr[data-key]").forEach((tr) => {
+        const win = tr.querySelector('[data-sf="window"]').value;
+        if (win) schedules[tr.dataset.key] = { window: win, auto: tr.querySelector('[data-sf="auto"]').checked, reboot: tr.querySelector('[data-sf="reboot"]').checked };
+      });
+      const r = await act(b, "/api/settings", { schedules }, "Saving…");
+      if (r) { toast("Schedules saved"); applySettings(r, ["schedules"]); refresh(); }
+      break;
+    }
     case "add-time":
       schedDraft.check_times.push("12:00");
       renderSettings(["schedule"]);
@@ -395,7 +455,7 @@ $("#view-settings").addEventListener("submit", async (e) => {
       if (r) {
         if (original) { editing.delete(original); delete tested[original]; delete fp[original]; }
         toast(original ? "Host saved" : `${v("name")} added. Now trust its fingerprint`);
-        applySettings(r, ["hosts", "schedule", "maintenance"]);
+        applySettings(r, ["hosts", "schedule", "schedules"]);
         refresh();
       }
       break;
@@ -411,16 +471,6 @@ $("#view-settings").addEventListener("submit", async (e) => {
         renderSettings(["hosts"]);
         if (tested[host].ok) refresh();
       }
-      break;
-    }
-    case "maint": {
-      const days = [...f.querySelectorAll(".mday.on")].map((x) => Number(x.dataset.mday));
-      const only = [...f.querySelectorAll('input[name="only"]:checked')].map((x) => x.value);
-      const r = await act(btn, "/api/settings", {
-        maintenance: { enabled: f.elements.enabled.checked, days, start: v("start"), end: v("end") },
-        maintenance_only: only,
-      }, "Saving…");
-      if (r) { toast("Maintenance window saved"); applySettings(r, ["maintenance"]); refresh(); }
       break;
     }
     case "discord": {
