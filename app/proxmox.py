@@ -9,6 +9,8 @@ import time
 
 import asyncssh
 
+from . import windows
+
 APT_FAMILY = {"debian", "ubuntu", "devuan", "raspbian", "linuxmint", "pop", "kali"}
 APK_FAMILY = {"alpine"}
 
@@ -96,6 +98,8 @@ def stack_update_script(name, files, prune=True):
 
 
 def family(ostype):
+    if ostype == "mswindows":
+        return "win"
     if ostype in APT_FAMILY:
         return "apt"
     if ostype in APK_FAMILY:
@@ -129,6 +133,7 @@ class Host:
                  known_hosts=None, console_url=None, host_console_url=None, kind="pve"):
         self.name = name
         self.kind = kind if kind in HOST_KINDS else "pve"
+        self.win_drivers = False  # include driver updates for Windows VMs
         self.address = address
         self.port = port
         self.user = user
@@ -267,6 +272,60 @@ class Host:
             raise RuntimeError("Command inside the VM did not finish in time")
         return int(d.get("exitcode", 1)), d.get("out-data", ""), d.get("err-data", "")
 
+    async def _ps(self, conn, vmid, script, timeout=300):
+        """Run a PowerShell script in a Windows VM through the guest agent."""
+        out = await self._run(conn, windows.ps_command(vmid, script, timeout), timeout=timeout + 30)
+        d = json.loads(out)
+        if not d.get("exited"):
+            raise RuntimeError("PowerShell inside the VM did not finish in time")
+        return int(d.get("exitcode", 1)), d.get("out-data", ""), d.get("err-data", "")
+
+    async def run_windows(self, vmid, on_line, max_hours=6):
+        """Install Windows updates via a SYSTEM scheduled task and follow its log."""
+        tag = windows.new_tag()
+        start, log = windows.start_script(tag, self.win_drivers)
+        conn = await self._connect()
+        try:
+            rc, out, err = await self._ps(conn, vmid, start, 120)
+            if rc != 0 or "started" not in out:
+                raise RuntimeError(f"Could not start Windows Update in the VM: {(err or out).strip()[-300:]}")
+            offset, buf, fails, deadline = 0, "", 0, time.time() + max_hours * 3600
+            while time.time() < deadline:
+                await asyncio.sleep(5)
+                try:
+                    if conn is None:
+                        conn = await self._connect()
+                    _, out, _ = await self._ps(conn, vmid, windows.poll_script(log, offset), 60)
+                    fails = 0
+                except Exception:
+                    fails += 1
+                    if conn is not None:
+                        conn.close()
+                        conn = None
+                    if fails > 36:
+                        raise RuntimeError(f"Lost contact with the VM's guest agent; Windows Update may still be running. Log: {log}")
+                    continue
+                head, _, data = out.partition("\n")
+                head = head.strip().lstrip("\ufeff")
+                if head.startswith("__LEN__"):
+                    offset = int(head[7:] or offset)
+                buf += data
+                *lines, buf = buf.split("\n")
+                for line in lines:
+                    line = line.rstrip("\r").lstrip("\ufeff")
+                    if line.startswith(windows.RC_MARK):
+                        try:
+                            await self._ps(conn, vmid, windows.cleanup_script(tag), 60)
+                        except Exception:
+                            pass
+                        return int(line[len(windows.RC_MARK):] or 1)
+                    if line:
+                        on_line(line)
+            raise RuntimeError(f"Windows Update is still running after {max_hours} hours. Log: {log}")
+        finally:
+            if conn is not None:
+                conn.close()
+
     async def _agent_ok(self, conn, vmid):
         r = await conn.run(f"qm guest cmd {int(vmid)} ping", check=False, timeout=25)
         return r.exit_status == 0
@@ -282,7 +341,16 @@ class Host:
                 return entry
             info = json.loads(await self._run(conn, f"qm guest cmd {vmid} get-osinfo", timeout=25))
             entry["os"] = info.get("id") or "unknown"
+            entry["os_name"] = info.get("pretty-name")
             fam = family(entry["os"])
+            if fam == "win":
+                rc, out, err = await self._ps(conn, vmid, windows.CHECK.replace(
+                    "__CRITERIA__", windows.criteria(self.win_drivers)), 900)
+                if rc != 0:
+                    raise RuntimeError(f"Windows Update search failed: {(err or out).strip()[-300:]}")
+                entry["packages"], entry["reboot"], os_name = windows.parse_check(out)
+                entry["os_name"] = os_name or entry["os_name"]
+                return entry
             if not fam:
                 entry["error"] = f"Unsupported OS: {info.get('pretty-name') or entry['os']}"
                 return entry
@@ -423,7 +491,8 @@ class Host:
     async def reboot_guest(self, vmid, kind, on_line, wait=300):
         tool = "pct" if kind == "lxc" else "qm"
         async with self._connect() as conn:
-            await self._run(conn, f"{tool} reboot {int(vmid)} --timeout 300", timeout=420)
+            # Windows can spend a long time "working on updates" while shutting down
+            await self._run(conn, f"{tool} reboot {int(vmid)} --timeout {max(300, wait)}", timeout=max(300, wait) + 120)
             on_line("Reboot command sent, waiting for it to come back…")
             end = time.time() + wait
             while time.time() < end:
@@ -434,7 +503,7 @@ class Host:
                 if kind == "lxc" or await self._agent_ok(conn, vmid):
                     on_line("Back up.")
                     return True
-        on_line("Still not back after 5 minutes; check it in Proxmox.")
+        on_line(f"Still not back after {wait // 60} minutes; check it in Proxmox.")
         return False
 
     async def reboot_self(self):

@@ -61,6 +61,9 @@ snapshots:
   keep: 3                         # pre-update snapshots kept per container
   on_failure: abort               # abort | continue (e.g. storage without snapshot support)
 
+windows_updates:
+  drivers: false                  # include driver updates for Windows VMs
+
 docker:
   enabled: true                   # check Compose stacks for new image versions
   prune: true                     # docker image prune -f after updating a stack

@@ -20,7 +20,7 @@ A small, self-hosted update dashboard for Proxmox VE hosts and their LXC contain
   image's registry (Docker Hub, GHCR, lscr.io, Quay…) whether a newer version exists, without
   pulling anything, and updates a stack with `docker compose pull && up -d`, now or in a window
 - **Proxmox Backup Server** and plain Debian/Ubuntu servers can be added as hosts too
-- Debian, Ubuntu, Devuan and Alpine guests (Windows VMs and other distros are listed but not updated)
+- Debian, Ubuntu, Devuan and Alpine guests, and **Windows VMs** (Windows Update through the guest agent)
 
 It connects only to your Proxmox hosts over SSH and runs commands inside containers with
 `pct exec`, so containers need no SSH server, key or agent. New containers are picked up automatically.
@@ -77,6 +77,25 @@ You can still edit the file by hand; see `config.example.yaml` for every option,
 ```bash
 cd /opt/patchdeck && git pull && venv/bin/pip install -r requirements.txt && systemctl restart patchdeck
 ```
+
+## Windows VMs
+
+Windows VMs (Windows Server 2016+ / Windows 10+) are checked and updated with Windows' own
+Windows Update service, driven through the QEMU guest agent; nothing else is installed in the VM.
+
+- **Needs** the QEMU guest agent from the VirtIO guest tools (`virtio-win-guest-tools.exe` on the
+  virtio-win ISO) and *QEMU Guest Agent* enabled in the VM's Options in Proxmox.
+- **Check** lists pending updates (KB, title, size) and whether Windows wants a reboot. Optional
+  and preview updates and feature upgrades are left out, like Windows' own automatic updates.
+  Driver updates are left out unless *Include driver updates for Windows VMs* is ticked in
+  Settings → General.
+- **Update** starts a one-off scheduled task inside the VM, running as SYSTEM, which searches,
+  downloads and installs the updates and writes a log that Patchdeck shows every few seconds.
+  The task and its files are removed afterwards.
+- **Reboot afterwards** uses `qm reboot` and waits up to 20 minutes for Windows to finish
+  "working on updates" and the guest agent to come back.
+- Windows keeps its own automatic update schedule; Patchdeck checks and updates alongside it.
+  Snapshots, maintenance windows and auto-update work as for Linux guests.
 
 ## Docker stacks
 
