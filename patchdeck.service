@@ -1,0 +1,12 @@
+[Unit]
+Description=Patchdeck
+After=network-online.target
+
+[Service]
+WorkingDirectory=/opt/patchdeck
+Environment=PATCHDECK_CONFIG=/opt/patchdeck/data/config.yaml
+ExecStart=/opt/patchdeck/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8080
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

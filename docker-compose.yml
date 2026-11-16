@@ -1,0 +1,11 @@
+services:
+  patchdeck:
+    build: .
+    container_name: patchdeck
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - TZ=Europe/London          # used for the scheduled check times
+    volumes:
+      - ./data:/data              # config.yaml, SSH key, known_hosts, state
