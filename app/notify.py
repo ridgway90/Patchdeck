@@ -5,7 +5,7 @@ import httpx
 log = logging.getLogger("patchdeck")
 
 
-async def discord(webhook, text):
+async def discord(webhook, text, raise_errors=False):
     if not webhook:
         return
     # Discord rejects messages over 2000 characters.
@@ -16,4 +16,6 @@ async def discord(webhook, text):
             r = await client.post(webhook, json={"content": text})
             r.raise_for_status()
     except Exception as e:
+        if raise_errors:
+            raise
         log.warning("Discord notification failed: %s", e)

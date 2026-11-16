@@ -133,7 +133,8 @@ function renderJobs(jobs) {
 
 function render() {
   if (!state) return;
-  $("#hosts").innerHTML = state.hosts.map(renderHost).join("");
+  $("#hosts").innerHTML = state.hosts.length ? state.hosts.map(renderHost).join("")
+    : `<section class="panel empty-state"><strong>No Proxmox hosts yet</strong><p class="muted">Add your hosts and set up SSH access in <a href="#settings">Settings</a>.</p></section>`;
   $("#jobs").innerHTML = renderJobs(state.jobs);
 
   let total = 0, targets = 0;

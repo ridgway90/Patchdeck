@@ -15,62 +15,64 @@ A small, self-hosted update dashboard for Proxmox VE hosts and their LXC contain
 It connects only to your Proxmox hosts over SSH and runs commands inside containers with
 `pct exec`, so containers need no SSH server, key or agent. New containers are picked up automatically.
 
-## Setup
+## Install (Debian LXC)
 
-### 1. Create an SSH key and authorise it on each Proxmox host
-
-On the machine (or LXC) that will run Patchdeck:
+Run as root in a fresh Debian container (unprivileged is fine; no special features needed):
 
 ```bash
-mkdir -p data && ssh-keygen -t ed25519 -N '' -C patchdeck -f data/id_ed25519
-```
-
-Copy the key to each host:
-
-```bash
-ssh-copy-id -i data/id_ed25519.pub root@192.168.1.10
-```
-
-Record the hosts' SSH fingerprints so Patchdeck can verify it's talking to the right machine:
-
-```bash
-ssh-keyscan 192.168.1.10 192.168.1.11 >> data/known_hosts
-```
-
-### 2. Configure
-
-```bash
-cp config.example.yaml data/config.yaml
-```
-
-Edit `data/config.yaml`: set a password, your hosts, and your Discord webhook
-(Discord channel → Edit Channel → Integrations → Webhooks → New Webhook → Copy URL).
-
-### 3. Run it
-
-**Docker:**
-
-```bash
-docker compose up -d --build
-```
-
-**Or directly in a Debian LXC:**
-
-```bash
-apt install -y python3-venv && cp -r . /opt/patchdeck && cd /opt/patchdeck && python3 -m venv venv && venv/bin/pip install -r requirements.txt
+apt update && apt install -y git python3-venv
 ```
 
 ```bash
-cp patchdeck.service /etc/systemd/system/ && systemctl enable --now patchdeck
+git clone https://github.com/ridgway90/Patchdeck /opt/patchdeck && cd /opt/patchdeck && python3 -m venv venv && venv/bin/pip install -r requirements.txt
 ```
 
-Open `http://<ip>:8080` and sign in with the username and password from the config.
-The first check runs on startup.
+Create a minimal config with a login password:
+
+```bash
+mkdir -p data && chmod 700 data && printf 'auth:\n  username: admin\n  password: CHANGE-ME\n' > data/config.yaml
+```
+
+```bash
+cp patchdeck.service /etc/systemd/system/ && systemctl daemon-reload && systemctl enable --now patchdeck
+```
+
+Set the container's timezone so scheduled checks run at your local time (e.g. `timedatectl set-timezone Europe/London`).
+
+Or with Docker: create `data/config.yaml` the same way, then `docker compose up -d --build`.
+
+## Setup (in the web UI)
+
+Open `http://<ip>:8080`, sign in, and go to **Settings**:
+
+1. **Generate SSH key**: Patchdeck creates its own key in `data/`.
+2. **Add a host**: name, IP and SSH port for each Proxmox host.
+3. **Trust the fingerprint**: Patchdeck shows the host's SSH fingerprint and the command to check
+   it on the host (`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` in the Proxmox shell).
+   Confirm they match and click **It matches, trust it**.
+4. **Install key**: enter the host's root password once (it's used to add the key and is not stored),
+   or copy the command shown and paste it into the host's shell yourself.
+5. **Test connection**, then go back to the Dashboard and click **Check now**.
+
+Also in Settings: check schedule (days and times), Discord webhook and test message, snapshot
+defaults, the dashboard address used in Discord links, and container IDs to hide.
+
+Settings are saved to `data/config.yaml` (the first save keeps a copy as `config.yaml.bak`).
+You can still edit the file by hand; see `config.example.yaml` for every option, then
+`systemctl restart patchdeck`.
+
+## Updating Patchdeck
+
+```bash
+cd /opt/patchdeck && git pull && venv/bin/pip install -r requirements.txt && systemctl restart patchdeck
+```
 
 ## Security notes
 
 - The SSH key gives root on your Proxmox hosts. Keep `data/` private and only expose Patchdeck
   on your LAN or Tailscale, not the internet.
+- The root password typed into **Install key** is sent to Patchdeck and then to the host over SSH;
+  it is never written to disk.
 - Login uses HTTP Basic auth, so use HTTPS (e.g. `tailscale serve`) if you reach it from outside your LAN.
 
 ## How updates run
