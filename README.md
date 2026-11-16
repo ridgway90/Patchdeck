@@ -10,10 +10,14 @@ A small, self-hosted update dashboard for Proxmox VE hosts and their LXC contain
 - **Live log** of each update in the page
 - **Console** buttons that open the Proxmox console (or Nexterm, or any URL you configure)
 - Scheduled checks with a **Discord** summary, plus a message when updates finish
-- **Maintenance window**: click 🌙 to run an update out of hours instead of now, or mark
-  containers to always wait for the window; one Discord summary per window
+- **Containers and VMs**: LXCs through `pct exec`, VMs through the QEMU guest agent
+  (install `qemu-guest-agent` in the VM and enable *QEMU Guest Agent* in its Options)
+- **Update dialog**: update now or schedule for a maintenance window, snapshot first,
+  and reboot afterwards if the update needs it
+- **Maintenance windows and schedules**: several named windows; give any container, VM or
+  host a window, optionally updating automatically in it; one Discord summary per window
 - **Proxmox Backup Server** and plain Debian/Ubuntu servers can be added as hosts too
-- Debian, Ubuntu, Devuan and Alpine containers
+- Debian, Ubuntu, Devuan and Alpine guests (Windows VMs and other distros are listed but not updated)
 
 It connects only to your Proxmox hosts over SSH and runs commands inside containers with
 `pct exec`, so containers need no SSH server, key or agent. New containers are picked up automatically.
@@ -58,8 +62,7 @@ Open `http://<ip>:8080`, sign in, and go to **Settings**:
    or copy the command shown and paste it into the host's shell yourself.
 5. **Test connection**, then go back to the Dashboard and click **Check now**.
 
-Also in Settings: the maintenance window (days, start and end time, and which targets always
-use it), check schedule (days and times), Discord webhook and test message, snapshot
+Also in Settings: maintenance windows and per-guest maintenance schedules, check schedule (days and times), Discord webhook and test message, snapshot
 defaults, the dashboard address used in Discord links, and container IDs to hide.
 
 Settings are saved to `data/config.yaml` (the first save keeps a copy as `config.yaml.bak`).

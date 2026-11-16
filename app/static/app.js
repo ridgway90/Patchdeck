@@ -63,31 +63,39 @@ function pkgList(pkgs) {
   return `<div class="pkgs">${pkgs.map((p) => `<span>${esc(p.name)}</span><span>${esc(p.from)} → ${esc(p.to)}</span>`).join("")}</div>`;
 }
 
-function windowLabel() {
-  const m = state && state.maintenance;
-  if (!m || !m.next_start) return null;
-  const d = new Date(m.next_start * 1000);
-  if (m.next_start * 1000 <= Date.now()) return "now";
-  return d.toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" });
+const fmtWhen = (ts) => new Date(ts * 1000).toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" });
+const fmtTime = (ts) => new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+
+function windowText(w) {
+  if (!w || !w.start) return w ? w.name : "";
+  const open = w.start * 1000 <= Date.now();
+  return open ? `${w.name} (open now, until ${fmtTime(w.end)})` : `${w.name}: ${fmtWhen(w.start)} – ${fmtTime(w.end)}`;
 }
 
-/* Update / schedule buttons for one target (a container, or a host when vmid is null). */
-function targetActions(hostName, vmid, t, n, updateLabel) {
+function findTarget(hostName, vmid) {
+  const h = state.hosts.find((x) => x.name === hostName);
+  if (!h) return null;
+  return vmid == null ? h : h.containers.find((c) => c.vmid === vmid);
+}
+
+/* Buttons for one target (a guest, or a host when vmid is null). */
+function targetActions(hostName, vmid, t, n, label) {
   if (t.job) return "";
   const v = vmid == null ? "" : ` data-vmid="${vmid}"`;
   const h = esc(hostName);
   if (t.scheduled) {
-    return `<button class="btn small sched" data-unschedule="${h}"${v} title="Scheduled for the maintenance window. Click to cancel.">🌙 ${esc(windowLabel() || "Scheduled")} <span aria-hidden="true">✕</span></button>`;
+    const w = t.scheduled.window;
+    const when = w && w.start ? (w.start * 1000 <= Date.now() ? "now" : fmtWhen(w.start)) : "scheduled";
+    return `<button class="btn small sched" data-dialog="${h}"${v} title="Scheduled for ${esc(windowText(w))}${t.scheduled.reboot ? ", with reboot if needed" : ""}. Click to change.">🌙 ${esc(when)}${t.scheduled.reboot ? " ↻" : ""}</button>`;
   }
   if (!n) return "";
-  const win = windowLabel();
-  const moonTitle = win ? `Schedule for the maintenance window (${win})` : "Set up a maintenance window in Settings to schedule updates";
-  if (t.maint_only) {
-    return `<button class="btn small primary" data-schedule="${h}"${v} title="${esc(moonTitle)}">🌙 Schedule</button>
-            <button class="btn small ghost" data-update="${h}"${v} title="Update now instead of waiting for the window">Now</button>`;
-  }
-  return `<button class="btn small ${vmid == null ? "" : "primary"}" data-update="${h}"${v}>${updateLabel}</button>
-          <button class="btn small icon" data-schedule="${h}"${v} title="${esc(moonTitle)}" aria-label="${esc(moonTitle)}">🌙</button>`;
+  return `<button class="btn small ${vmid == null ? "" : "primary"}" data-dialog="${h}"${v}>${label}</button>`;
+}
+
+function scheduleTag(t) {
+  if (!t.schedule) return "";
+  const p = t.schedule;
+  return `<span class="pill sched-tag" title="Maintenance schedule: ${esc(p.window)}${p.auto ? ", updates automatically" : ""}${p.reboot ? ", reboots if needed" : ""}">🌙 ${esc(p.window)}${p.auto ? " · auto" : ""}</span>`;
 }
 
 function renderRow(host, c) {
@@ -101,14 +109,15 @@ function renderRow(host, c) {
   else stateHtml = n ? `<button class="pill ${n >= 20 ? "bad" : "warn"}" data-pkgs="${esc(key)}" title="Show packages">${n} update${n === 1 ? "" : "s"} ▾</button>` : countPill(0);
   if (c.reboot) stateHtml += `<span class="pill bad">Reboot needed</span>`;
   if (c.warning) stateHtml += `<span class="pill warn" title="${esc(c.warning)}">!</span>`;
+  stateHtml += scheduleTag(c);
 
   return `
     <div class="row${running ? "" : " dim"}">
-      <div class="ct-name"><strong>${esc(c.name)}</strong><span class="vmid">${c.vmid}</span></div>
-      <div class="os">${esc(c.os || "")}</div>
+      <div class="ct-name"><strong>${esc(c.name)}</strong><span class="vmid">${c.vmid}</span>${c.type === "vm" ? `<span class="kind-tag">VM</span>` : ""}</div>
+      <div class="os">${esc(({ mswindows: "Windows" })[c.os] || c.os || "")}</div>
       <div class="state">${stateHtml}</div>
       <div class="row-actions">
-        ${running ? targetActions(host.name, c.vmid, c, n, "Update") : ""}
+        ${running ? targetActions(host.name, c.vmid, c, n, "Update…") : ""}
         ${c.console ? `<a class="btn small" href="${esc(c.console)}" target="_blank" rel="noopener">Console</a>` : ""}
       </div>
       ${openPkgs.has(key) && n ? pkgList(c.packages) : ""}
@@ -140,7 +149,8 @@ function renderHost(h) {
         <div class="host-meta">${meta}</div>
         <div class="host-actions">
           <button class="btn small" data-check="${esc(h.name)}" ${h.checking ? "disabled" : ""}>Check</button>
-          ${targetActions(h.name, null, h, n, isPve ? "Update host" : "Update")}
+          ${scheduleTag(h)}
+          ${targetActions(h.name, null, h, n, isPve ? "Update host…" : "Update…")}
           ${h.console ? `<a class="btn small" href="${esc(h.console)}" target="_blank" rel="noopener">Shell</a>` : ""}
         </div>
       </div>
@@ -175,7 +185,7 @@ function render() {
   }
   const last = Math.max(0, ...state.hosts.map((h) => h.checked_at || 0));
   const next = state.next_check ? ` · next check ${clock(state.next_check)}` : "";
-  const sched = state.maintenance && state.maintenance.scheduled ? ` · ${state.maintenance.scheduled} scheduled for ${windowLabel()}` : "";
+  const sched = state.scheduled_count ? ` · ${state.scheduled_count} scheduled` : "";
   $("#summary").textContent = (total ? `${total} updates on ${targets} target${targets === 1 ? "" : "s"}` : "Everything up to date") + ` · checked ${ago(last || null)}${next}${sched}`;
   const ctPending = state.hosts.some((h) => h.containers.some((c) => c.packages.length && !c.job && c.status === "running"));
   $("#update-all").disabled = !ctPending;
@@ -217,15 +227,119 @@ function openLog(jobId, title) {
   src.onerror = () => { if (src.readyState === EventSource.CLOSED) return; };
 }
 
-async function startUpdate(host, vmid) {
-  const ct = vmid == null ? null : state.hosts.find((h) => h.name === host).containers.find((c) => c.vmid === vmid);
-  if (vmid == null && !confirm(`Run apt dist-upgrade on ${host} now?`)) return;
+/* ---------- update dialog ---------- */
+
+let dlg = null;  // { host, vmid, all }
+
+function openUpdateDialog(host, vmid, all = false) {
+  const t = all ? null : findTarget(host, vmid);
+  if (!all && !t) return;
+  dlg = { host, vmid, all };
+  const wins = state.windows || [];
+  const isHost = !all && vmid == null;
+  const hostObj = isHost ? t : null;
+  const policy = t && t.schedule;
+  const sched = t && t.scheduled;
+
+  let title, sub;
+  if (all) {
+    const pend = state.hosts.flatMap((h) => h.containers).filter((c) => c.packages.length && !c.job && !c.scheduled && c.status === "running");
+    const withPolicy = pend.filter((c) => c.schedule).length;
+    title = "Update all guests";
+    sub = `${pend.length} container${pend.length === 1 ? "" : "s"}/VM${pend.length === 1 ? "" : "s"} with updates. Hosts are updated separately.`;
+    $("#upd-override-row").hidden = !withPolicy;
+    $("#upd-override-text").textContent = `Also update the ${withPolicy} with their own maintenance schedule now (otherwise they're queued for their window)`;
+    $("#upd-override").checked = false;
+  } else {
+    const n = isHost ? (t.host ? t.host.packages.length : 0) : t.packages.length;
+    title = isHost ? `Update ${host}` : `Update ${t.name}`;
+    sub = `${n} package${n === 1 ? "" : "s"} to update` + (isHost ? ` on the ${({ pve: "Proxmox host", pbs: "Backup Server" })[hostObj.kind] || "server"}` : ` · ${t.type === "vm" ? "VM" : "container"} ${vmid} on ${host}`);
+    $("#upd-override-row").hidden = true;
+  }
+  $("#upd-title").textContent = title;
+  $("#upd-sub").textContent = sub;
+
+  const sel = $("#upd-window");
+  sel.innerHTML = wins.map((w) => `<option value="${esc(w.name)}">${esc(windowText(w))}</option>`).join("");
+  const wanted = (sched && sched.window && sched.window.name) || (policy && policy.window) || (wins[0] && wins[0].name);
+  if (wanted) sel.value = wanted;
+  const radios = document.querySelectorAll('#upd-form input[name="when"]');
+  radios[1].disabled = !wins.length;
+  sel.disabled = !wins.length;
+  $("#upd-win-hint").textContent = wins.length ? (policy ? `This ${isHost ? "host" : "guest"} normally uses "${policy.window}".` : "") : "Add a maintenance window in Settings to use this.";
+  $("#upd-now-hint").textContent = all ? "" : "Runs straight away and shows the live log.";
+  const when = sched || (policy && wins.length) ? "schedule" : "now";
+  radios.forEach((r) => (r.checked = r.value === when));
+
+  $("#upd-snap-row").hidden = isHost;
+  $("#upd-snap").checked = sched ? sched.snapshot : store.get("snapshot", state.snapshot_default);
+  $("#upd-reboot").checked = sched ? sched.reboot : policy ? policy.reboot : store.get("reboot", false);
+  $("#upd-unschedule").hidden = !sched;
+  syncDialog();
+  $("#upd").showModal();
+}
+
+function syncDialog() {
+  if (!dlg) return;
+  const when = document.querySelector('#upd-form input[name="when"]:checked').value;
+  $("#upd-go").textContent = when === "now" ? "Update now" : (dlg.all ? "Schedule all" : "Schedule");
+  $("#upd-window").closest(".choice").classList.toggle("on", when === "schedule");
+  const isHost = !dlg.all && dlg.vmid == null;
+  const warn = $("#upd-warn");
+  if (isHost && $("#upd-reboot").checked) {
+    const h = findTarget(dlg.host, null);
+    warn.textContent = h.kind === "pve"
+      ? "Rebooting a Proxmox host restarts every guest on it (1 minute after the update). If Patchdeck runs on this host it will be offline for a few minutes too."
+      : "The server reboots 1 minute after the update. Anything running on it (e.g. backups on a PBS) will be interrupted.";
+    warn.hidden = false;
+  } else warn.hidden = true;
+}
+
+$("#upd-form").addEventListener("change", syncDialog);
+$("#upd-cancel").addEventListener("click", () => $("#upd").close());
+
+$("#upd-unschedule").addEventListener("click", async () => {
   try {
-    const job = await api("/api/update", { host, vmid, snapshot: $("#snapshot").checked });
-    openLog(job.id, `Update · ${ct ? ct.name : host + " (host)"}`);
+    await api("/api/schedule/cancel", { host: dlg.host, vmid: dlg.vmid });
+    $("#upd").close();
+    toast("Removed from the maintenance window");
     refresh();
   } catch (e) { toast(e.message); }
-}
+});
+
+$("#upd-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const when = document.querySelector('#upd-form input[name="when"]:checked').value;
+  const snapshot = !$("#upd-snap-row").hidden && $("#upd-snap").checked;
+  const reboot = $("#upd-reboot").checked;
+  const window = $("#upd-window").value;
+  if (!$("#upd-snap-row").hidden) store.set("snapshot", snapshot);
+  store.set("reboot", reboot);
+  const go = $("#upd-go");
+  go.disabled = true;
+  try {
+    if (dlg.all) {
+      const r = await api("/api/update-all", { mode: when, window, snapshot, reboot, override: $("#upd-override").checked });
+      const parts = [];
+      if (r.jobs.length) parts.push(`Started ${r.jobs.length} update${r.jobs.length === 1 ? "" : "s"}`);
+      if (r.scheduled) parts.push(`${r.scheduled} scheduled`);
+      toast(parts.join(" · ") || "Nothing to update");
+      $("#upd").close();
+      if (r.jobs.length) openLog(r.jobs[0].id);
+    } else if (when === "now") {
+      const job = await api("/api/update", { host: dlg.host, vmid: dlg.vmid, snapshot, reboot });
+      $("#upd").close();
+      const t = findTarget(dlg.host, dlg.vmid);
+      openLog(job.id, `Update · ${dlg.vmid == null ? dlg.host : t.name}`);
+    } else {
+      await api("/api/schedule", { host: dlg.host, vmid: dlg.vmid, snapshot, reboot, window });
+      $("#upd").close();
+      toast(`Scheduled: ${$("#upd-window").selectedOptions[0].textContent}`);
+    }
+    refresh();
+  } catch (err) { toast(err.message); }
+  finally { go.disabled = false; }
+});
 
 document.addEventListener("click", async (e) => {
   const t = e.target.closest("button, li[data-log]");
@@ -239,20 +353,8 @@ document.addEventListener("click", async (e) => {
     const k = t.dataset.pkgs;
     openPkgs.has(k) ? openPkgs.delete(k) : openPkgs.add(k);
     render();
-  } else if (t.dataset.schedule) {
-    try {
-      await api("/api/schedule", { host: t.dataset.schedule, vmid: t.dataset.vmid ? Number(t.dataset.vmid) : null, snapshot: $("#snapshot").checked });
-      await refresh();
-      toast(`Scheduled for the maintenance window (${windowLabel()})`);
-    } catch (err) { toast(err.message); }
-  } else if (t.dataset.unschedule) {
-    try {
-      await api("/api/schedule/cancel", { host: t.dataset.unschedule, vmid: t.dataset.vmid ? Number(t.dataset.vmid) : null });
-      toast("Removed from the maintenance window");
-      refresh();
-    } catch (err) { toast(err.message); }
-  } else if (t.dataset.update) {
-    startUpdate(t.dataset.update, t.dataset.vmid ? Number(t.dataset.vmid) : null);
+  } else if (t.dataset.dialog) {
+    openUpdateDialog(t.dataset.dialog, t.dataset.vmid ? Number(t.dataset.vmid) : null);
   } else if (t.dataset.check) {
     try { const r = await api("/api/check", { host: t.dataset.check }); openLog(r.jobs[0].id, `Check · ${t.dataset.check}`); refresh(); }
     catch (err) { toast(err.message); }
@@ -265,24 +367,7 @@ $("#check-all").addEventListener("click", async () => {
   try { await api("/api/check", {}); toast("Checking all hosts…"); refresh(); } catch (e) { toast(e.message); }
 });
 
-$("#update-all").addEventListener("click", async () => {
-  const snap = $("#snapshot").checked;
-  const cts = state.hosts.flatMap((h) => h.containers).filter((c) => c.packages.length && !c.job && !c.scheduled && c.status === "running");
-  const later = windowLabel() ? cts.filter((c) => c.maint_only).length : 0;
-  const msg = `Update ${cts.length - later} container${cts.length - later === 1 ? "" : "s"} now${snap ? " (snapshot first)" : ""}?`
-    + (later ? `\n${later} marked "maintenance window only" will be scheduled for ${windowLabel()} instead.` : "")
-    + "\nHosts are not included.";
-  if (!confirm(msg)) return;
-  try {
-    const r = await api("/api/update-all", { snapshot: snap });
-    const parts = [];
-    if (r.jobs.length) parts.push(`Started ${r.jobs.length} update${r.jobs.length === 1 ? "" : "s"}`);
-    if (r.scheduled) parts.push(`${r.scheduled} scheduled for the maintenance window`);
-    toast(parts.join(" · ") || "Nothing to update");
-    if (r.jobs.length) openLog(r.jobs[0].id);
-    refresh();
-  } catch (e) { toast(e.message); }
-});
+$("#update-all").addEventListener("click", () => openUpdateDialog(null, null, true));
 
 $("#log-close").addEventListener("click", () => {
   if (logSource) logSource.close();
@@ -290,9 +375,7 @@ $("#log-close").addEventListener("click", () => {
   logJobId = null;
 });
 
-$("#snapshot").addEventListener("change", (e) => store.set("snapshot", e.target.checked));
 
 (async function init() {
   await refresh();
-  $("#snapshot").checked = store.get("snapshot", state ? state.snapshot_default : true);
 })();
