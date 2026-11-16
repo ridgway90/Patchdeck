@@ -480,7 +480,8 @@ $("#view-settings").addEventListener("click", async (e) => {
       document.querySelectorAll("#s-schedules tr[data-key]").forEach((tr) => {
         const win = tr.querySelector('[data-sf="window"]').value;
         const rb = tr.querySelector('[data-sf="reboot"]');
-        if (win) schedules[tr.dataset.key] = { window: win, auto: tr.querySelector('[data-sf="auto"]').checked, reboot: !!(rb && rb.checked) };
+        // null removes a schedule; targets not listed on this page keep theirs
+        schedules[tr.dataset.key] = win ? { window: win, auto: tr.querySelector('[data-sf="auto"]').checked, reboot: !!(rb && rb.checked) } : null;
       });
       const r = await act(b, "/api/settings", { schedules }, "Saving…");
       if (r) { toast("Schedules saved"); applySettings(r, ["schedules"]); refresh(); }

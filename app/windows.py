@@ -39,29 +39,34 @@ $ErrorActionPreference = 'Stop'
 """
 
 CHECK = PRELUDE + r"""# PATCHDECK:CHECK
-$session = New-Object -ComObject Microsoft.Update.Session
-$session.ClientApplicationID = 'Patchdeck'
-$result = $session.CreateUpdateSearcher().Search("__CRITERIA__")
-$list = @()
-foreach ($u in $result.Updates) {
-    $cats = @($u.Categories | ForEach-Object { $_.Name })
-    if ($cats -contains 'Upgrades') { continue }   # feature upgrades are left to Windows
-    $list += [pscustomobject]@{
-        title    = $u.Title
-        kb       = (@($u.KBArticleIDs | ForEach-Object { "KB$_" }) -join ', ')
-        size     = [int64]$u.MaxDownloadSize
-        category = ($cats -join ', ')
-        severity = [string]$u.MsrcSeverity
+try {
+    $session = New-Object -ComObject Microsoft.Update.Session
+    $session.ClientApplicationID = 'Patchdeck'
+    $result = $session.CreateUpdateSearcher().Search("__CRITERIA__")
+    $list = @()
+    foreach ($u in $result.Updates) {
+        $cats = @($u.Categories | ForEach-Object { $_.Name })
+        if ($cats -contains 'Upgrades') { continue }   # feature upgrades are left to Windows
+        $list += [pscustomobject]@{
+            title    = $u.Title
+            kb       = (@($u.KBArticleIDs | ForEach-Object { "KB$_" }) -join ', ')
+            size     = [int64]$u.MaxDownloadSize
+            category = ($cats -join ', ')
+            severity = [string]$u.MsrcSeverity
+        }
     }
+    $keys = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+    )
+    $reboot = (New-Object -ComObject Microsoft.Update.SystemInfo).RebootRequired
+    foreach ($k in $keys) { if (Test-Path $k) { $reboot = $true } }
+    $os = (Get-CimInstance Win32_OperatingSystem).Caption
+    [pscustomobject]@{ updates = $list; reboot = [bool]$reboot; os = $os } | ConvertTo-Json -Depth 4 -Compress
+} catch {
+    [Console]::Error.WriteLine($_.Exception.Message)
+    exit 1
 }
-$keys = @(
-    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
-    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
-)
-$reboot = (New-Object -ComObject Microsoft.Update.SystemInfo).RebootRequired
-foreach ($k in $keys) { if (Test-Path $k) { $reboot = $true } }
-$os = (Get-CimInstance Win32_OperatingSystem).Caption
-[pscustomobject]@{ updates = $list; reboot = [bool]$reboot; os = $os } | ConvertTo-Json -Depth 4 -Compress
 """
 
 # Runs as SYSTEM from a scheduled task. __LOG__ and __CRITERIA__ are filled in by Python.

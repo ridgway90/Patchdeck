@@ -132,7 +132,10 @@ Patchdeck needs outbound HTTPS to the registries for this. Turn it off under Set
 - Containers: `apt-get dist-upgrade` (keeping existing config files) or `apk upgrade`.
 - Hosts: `apt-get dist-upgrade`, as Proxmox recommends. Patchdeck doesn't reboot anything; it shows
   **Reboot needed** when a new kernel is installed or a package asks for a reboot.
-- Updates run detached on the host, so a dropped connection won't kill `apt` halfway.
+- Updates run detached on the host, so a dropped connection won't kill `apt` halfway; Patchdeck
+  reconnects and carries on showing the output.
+- `apt` waits up to 5 minutes for another package manager (e.g. unattended-upgrades) to finish
+  instead of failing straight away.
 - Updates on the same host run one at a time; different hosts run in parallel.
 - If a snapshot fails (e.g. the container's storage doesn't support snapshots), the update is
   aborted unless `snapshots.on_failure: continue` is set. Untick **Snapshot first** to skip it.
