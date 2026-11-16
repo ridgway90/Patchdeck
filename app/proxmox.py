@@ -69,10 +69,14 @@ def ct_cmd(vmid, inner):
     return f"pct exec {int(vmid)} -- sh -c {shlex.quote(inner)}"
 
 
+HOST_KINDS = {"pve": "Proxmox VE", "pbs": "Proxmox Backup Server", "debian": "Debian/Ubuntu server"}
+
+
 class Host:
     def __init__(self, name, address, port=22, user="root", key_file=None,
-                 known_hosts=None, console_url=None, host_console_url=None):
+                 known_hosts=None, console_url=None, host_console_url=None, kind="pve"):
         self.name = name
+        self.kind = kind if kind in HOST_KINDS else "pve"
         self.address = address
         self.port = port
         self.user = user
@@ -151,6 +155,9 @@ class Host:
         async with self._connect() as conn:
             node = (await self._run(conn, "hostname", timeout=15)).strip()
             host_info = await self._check_self(conn)
+            if self.kind != "pve":
+                return {"node": node, "host": host_info, "containers": [],
+                        "checked_at": time.time(), "error": None}
             raw = await self._run(conn, f"pvesh get /nodes/{shlex.quote(node)}/lxc --output-format json", timeout=60)
             lxcs = sorted(json.loads(raw), key=lambda c: int(c["vmid"]))
             sem = asyncio.Semaphore(4)
