@@ -96,7 +96,17 @@ def effective(raw):
     cfg["schedule"].setdefault("days", list(range(7)))
     cfg["exclude"] = cfg.get("exclude") or []
     dk = cfg.get("docker") if isinstance(cfg.get("docker"), dict) else {}
-    cfg["docker"] = {"enabled": bool(dk.get("enabled", True)), "prune": bool(dk.get("prune", True))}
+    logins = []
+    for lg in dk.get("logins") or []:
+        if isinstance(lg, dict) and lg.get("username"):
+            logins.append({"registry": registry.normalise_registry(lg.get("registry")),
+                           "username": str(lg["username"]), "token": str(lg.get("token") or "")})
+    if os.environ.get("DOCKERHUB_USERNAME") and os.environ.get("DOCKERHUB_TOKEN"):
+        logins = [lg for lg in logins if lg["registry"] != "registry-1.docker.io"]
+        logins.append({"registry": "registry-1.docker.io", "username": os.environ["DOCKERHUB_USERNAME"],
+                       "token": os.environ["DOCKERHUB_TOKEN"], "env": True})
+    cfg["docker"] = {"enabled": bool(dk.get("enabled", True)), "prune": bool(dk.get("prune", True)),
+                     "logins": logins}
     cfg["maintenance"], cfg["schedules"] = normalise_maintenance(cfg)
     cfg["hosts"] = cfg.get("hosts") or []
     if os.environ.get("PATCHDECK_PASSWORD"):
@@ -307,7 +317,8 @@ async def annotate_docker(entries):
     targets = [e for e in entries if e and e.get("stacks")]
     if not targets or not DOCKER["enabled"]:
         return
-    reg = registry.Registry()
+    reg = registry.Registry(logins={lg["registry"]: (lg["username"], lg["token"])
+                                    for lg in DOCKER["logins"] if lg["token"]})
     try:
         await asyncio.gather(*(registry.annotate(e["stacks"], reg) for e in targets))
     finally:
@@ -1118,7 +1129,10 @@ def settings_payload():
                     "on_check": DISCORD.get("on_check", "always"),
                     "on_update": bool(DISCORD.get("on_update", True))},
         "snapshots": SNAP,
-        "docker": DOCKER,
+        "docker": {"enabled": DOCKER["enabled"], "prune": DOCKER["prune"],
+                   "logins": [{"registry": lg["registry"], "username": lg["username"],
+                               "token_set": bool(lg["token"]), "from_env": bool(lg.get("env"))}
+                              for lg in DOCKER["logins"]]},
         "windows": [{**w, "next_start": (window_info(w["name"]) or {}).get("start")} for w in WINDOWS],
         "schedules": SCHEDULES,
         "targets": [{"host": n, "kind": h.kind,
@@ -1209,7 +1223,29 @@ async def api_settings_save(request: Request):
         RAW["schedules"] = scheds
         RAW.pop("maintenance_only", None)
     if "docker" in b:
-        RAW["docker"] = {"enabled": bool(b["docker"].get("enabled", True)), "prune": bool(b["docker"].get("prune", True))}
+        d = b["docker"]
+        raw = RAW.get("docker") if isinstance(RAW.get("docker"), dict) else {}
+        new = {"enabled": bool(d.get("enabled", raw.get("enabled", True))),
+               "prune": bool(d.get("prune", raw.get("prune", True))),
+               "logins": raw.get("logins") or []}
+        if "logins" in d:
+            # Tokens are never sent to the browser: an empty token keeps the saved one.
+            saved = {registry.normalise_registry(lg.get("registry")): lg for lg in raw.get("logins") or []}
+            logins, seen = [], set()
+            for lg in d["logins"]:
+                reg_name = registry.normalise_registry(lg.get("registry"))
+                user = str(lg.get("username") or "").strip()
+                if not user:
+                    continue
+                if reg_name in seen:
+                    bad(f"Two logins for {reg_name}")
+                seen.add(reg_name)
+                token = str(lg.get("token") or "").strip() or (saved.get(reg_name) or {}).get("token", "")
+                if not token:
+                    bad(f"Enter the password or access token for {reg_name}")
+                logins.append({"registry": reg_name, "username": user, "token": token})
+            new["logins"] = logins
+        RAW["docker"] = new
     if "base_url" in b:
         RAW["base_url"] = str(b["base_url"]).strip()
     if "exclude" in b:
@@ -1222,6 +1258,20 @@ async def api_settings_save(request: Request):
     except (ValueError, SystemExit) as e:
         bad(str(e))
     return settings_payload()
+
+
+@app.post("/api/settings/registry-test")
+async def api_registry_test(request: Request):
+    b = await _body(request)
+    reg_name = registry.normalise_registry(b.get("registry"))
+    user = str(b.get("username") or "").strip()
+    token = str(b.get("token") or "").strip()
+    if not token:  # test the saved token
+        token = next((lg["token"] for lg in DOCKER["logins"] if lg["registry"] == reg_name), "")
+    if not user or not token:
+        bad("Enter a username and token first")
+    ok, msg = await registry.test_login(reg_name, user, token)
+    return {"ok": ok, "message": msg}
 
 
 @app.post("/api/settings/discord-test")

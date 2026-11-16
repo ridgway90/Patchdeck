@@ -353,3 +353,4 @@ form.inline input { flex: 1 1 200px; max-width: 320px; }
   .pkgs.imgs { grid-template-columns: 1fr; }
   .pkgs.imgs span:nth-child(even) { margin-bottom: 6px; }
 }
+.login-result { font-size: 13px; }

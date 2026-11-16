@@ -92,6 +92,12 @@ local image with the digest of the same tag in its registry:
   requests, which Docker Hub allows about 100 an hour per IP for anonymous clients; a homelab
   checked a few times a day stays well below that.
 
+**Registry logins** (Settings → Docker): add a Docker Hub username and a read-only personal access
+token to raise Docker Hub's limit, or a login for ghcr.io or a private registry so its private
+images can be checked. **Test login** confirms it works and, for Docker Hub, shows how many lookups
+are left. Tokens are stored in `config.yaml` and never sent back to the browser. Docker Hub can also
+be set with the `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` environment variables.
+
 Patchdeck needs outbound HTTPS to the registries for this. Turn it off under Settings → General.
 
 ## Security notes
