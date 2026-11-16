@@ -72,16 +72,19 @@ function windowText(w) {
   return open ? `${w.name} (open now, until ${fmtTime(w.end)})` : `${w.name}: ${fmtWhen(w.start)} – ${fmtTime(w.end)}`;
 }
 
-function findTarget(hostName, vmid) {
+function findTarget(hostName, vmid, stack) {
   const h = state.hosts.find((x) => x.name === hostName);
   if (!h) return null;
-  return vmid == null ? h : h.containers.find((c) => c.vmid === vmid);
+  const t = vmid == null ? h : h.containers.find((c) => c.vmid === vmid);
+  if (!stack || !t) return t;
+  const stacks = (vmid == null ? (t.host || {}).stacks : t.stacks) || [];
+  return stacks.find((x) => x.name === stack) || null;
 }
 
 /* Buttons for one target (a guest, or a host when vmid is null). */
-function targetActions(hostName, vmid, t, n, label) {
+function targetActions(hostName, vmid, t, n, label, stack) {
   if (t.job) return "";
-  const v = vmid == null ? "" : ` data-vmid="${vmid}"`;
+  const v = (vmid == null ? "" : ` data-vmid="${vmid}"`) + (stack ? ` data-stack="${esc(stack)}"` : "");
   const h = esc(hostName);
   if (t.scheduled) {
     const w = t.scheduled.window;
@@ -89,7 +92,38 @@ function targetActions(hostName, vmid, t, n, label) {
     return `<button class="btn small sched" data-dialog="${h}"${v} title="Scheduled for ${esc(windowText(w))}${t.scheduled.reboot ? ", with reboot if needed" : ""}. Click to change.">🌙 ${esc(when)}${t.scheduled.reboot ? " ↻" : ""}</button>`;
   }
   if (!n) return "";
-  return `<button class="btn small ${vmid == null ? "" : "primary"}" data-dialog="${h}"${v}>${label}</button>`;
+  return `<button class="btn small ${vmid == null && !stack ? "" : "primary"}" data-dialog="${h}"${v}>${label}</button>`;
+}
+
+const IMG_STATUS = { update: ["warn", "New version"], current: ["ok", "Current"], local: ["", "Local build"], unknown: ["", "Can't check"] };
+
+function stackRows(host, vmid, stacks, dockerError) {
+  let out = "";
+  if (dockerError) out += `<div class="row stack-row"><div class="ct-name"><span class="whale" aria-hidden="true">🐳</span><span class="err">${esc(dockerError)}</span></div></div>`;
+  for (const st of stacks || []) {
+    const key = `${host.name}/${vmid}/stack/${st.name}`;
+    const n = st.updates || 0;
+    const imgs = st.images || [];
+    let stateHtml;
+    if (st.job) stateHtml = jobPill(st.job);
+    else if (!imgs.length) stateHtml = `<span class="pill">No images</span>`;
+    else stateHtml = `<button class="pill ${n ? "warn" : "ok"}" data-pkgs="${esc(key)}" title="Show images">${n ? `${n} image update${n === 1 ? "" : "s"}` : "Images current"} ▾</button>`;
+    const unknown = imgs.filter((i) => i.status === "unknown").length;
+    if (unknown && !st.job) stateHtml += `<span class="pill" title="${esc(imgs.filter((i) => i.status === "unknown").map((i) => `${i.ref}: ${i.note}`).join("\n"))}">${unknown} unchecked</span>`;
+    stateHtml += scheduleTag(st);
+    out += `
+      <div class="row stack-row">
+        <div class="ct-name"><span class="whale" aria-hidden="true">🐳</span><strong>${esc(st.name)}</strong></div>
+        <div class="os">${esc(st.status || "")}</div>
+        <div class="state">${stateHtml}</div>
+        <div class="row-actions">${targetActions(host.name, vmid, st, n, "Update…", st.name)}</div>
+        ${openPkgs.has(key) ? `<div class="pkgs imgs">${imgs.map((i) => {
+          const [cls, label] = IMG_STATUS[i.status] || ["", i.status];
+          return `<span>${esc(i.ref)}</span><span class="${cls}-text" title="${esc(i.note || "")}">${label}${i.note ? ` · ${esc(i.note)}` : ""}</span>`;
+        }).join("")}</div>` : ""}
+      </div>`;
+  }
+  return out;
 }
 
 function scheduleTag(t) {
@@ -121,7 +155,7 @@ function renderRow(host, c) {
         ${c.console ? `<a class="btn small" href="${esc(c.console)}" target="_blank" rel="noopener">Console</a>` : ""}
       </div>
       ${openPkgs.has(key) && n ? pkgList(c.packages) : ""}
-    </div>`;
+    </div>${running ? stackRows(host, c.vmid, c.stacks, c.docker_error) : ""}`;
 }
 
 function renderHost(h) {
@@ -137,8 +171,9 @@ function renderHost(h) {
 
   const cts = h.containers || [];
   const isPve = h.kind === "pve";
-  const rows = cts.length ? cts.map((c) => renderRow(h, c)).join("")
-    : isPve ? `<div class="empty">${h.checked_at ? "No containers found." : "Not checked yet."}</div>` : "";
+  const hostStacks = h.host ? stackRows(h, null, h.host.stacks, h.host.docker_error) : "";
+  const rows = (cts.length ? cts.map((c) => renderRow(h, c)).join("")
+    : isPve ? `<div class="empty">${h.checked_at ? "No containers found." : "Not checked yet."}</div>` : "") + hostStacks;
   const kindLabel = { pbs: "Backup Server", debian: "Server" }[h.kind];
 
   return `
@@ -171,6 +206,15 @@ function renderJobs(jobs) {
     </li>`).join("");
 }
 
+function allStacks() {
+  const out = [];
+  for (const h of state.hosts) {
+    for (const st of (h.host && h.host.stacks) || []) out.push({ host: h.name, vmid: null, st });
+    for (const c of h.containers) if (c.status === "running") for (const st of c.stacks || []) out.push({ host: h.name, vmid: c.vmid, st });
+  }
+  return out;
+}
+
 function render() {
   if (!state) return;
   $("#hosts").innerHTML = state.hosts.length ? state.hosts.map(renderHost).join("")
@@ -185,9 +229,11 @@ function render() {
   }
   const last = Math.max(0, ...state.hosts.map((h) => h.checked_at || 0));
   const next = state.next_check ? ` · next check ${clock(state.next_check)}` : "";
-  const sched = state.scheduled_count ? ` · ${state.scheduled_count} scheduled` : "";
+  const stacksPending = allStacks().filter((x) => x.st.updates && !x.st.job && !x.st.scheduled);
+  const sched = (stacksPending.length ? ` · ${stacksPending.length} Docker stack${stacksPending.length === 1 ? "" : "s"} with updates` : "")
+    + (state.scheduled_count ? ` · ${state.scheduled_count} scheduled` : "");
   $("#summary").textContent = (total ? `${total} updates on ${targets} target${targets === 1 ? "" : "s"}` : "Everything up to date") + ` · checked ${ago(last || null)}${next}${sched}`;
-  const ctPending = state.hosts.some((h) => h.containers.some((c) => c.packages.length && !c.job && c.status === "running"));
+  const ctPending = stacksPending.length || state.hosts.some((h) => h.containers.some((c) => c.packages.length && !c.job && c.status === "running"));
   $("#update-all").disabled = !ctPending;
   $("#check-all").disabled = state.hosts.some((h) => h.checking);
 }
@@ -229,14 +275,14 @@ function openLog(jobId, title) {
 
 /* ---------- update dialog ---------- */
 
-let dlg = null;  // { host, vmid, all }
+let dlg = null;  // { host, vmid, all, stack }
 
-function openUpdateDialog(host, vmid, all = false) {
-  const t = all ? null : findTarget(host, vmid);
+function openUpdateDialog(host, vmid, all = false, stack = null) {
+  const t = all ? null : findTarget(host, vmid, stack);
   if (!all && !t) return;
-  dlg = { host, vmid, all };
+  dlg = { host, vmid, all, stack };
   const wins = state.windows || [];
-  const isHost = !all && vmid == null;
+  const isHost = !all && vmid == null && !stack;
   const hostObj = isHost ? t : null;
   const policy = t && t.schedule;
   const sched = t && t.scheduled;
@@ -250,11 +296,23 @@ function openUpdateDialog(host, vmid, all = false) {
     $("#upd-override-row").hidden = !withPolicy;
     $("#upd-override-text").textContent = `Also update the ${withPolicy} with their own maintenance schedule now (otherwise they're queued for their window)`;
     $("#upd-override").checked = false;
+    const stk = allStacks().filter((x) => x.st.updates && !x.st.job && !x.st.scheduled && x.vmid != null);
+    $("#upd-docker-row").hidden = !stk.length;
+    $("#upd-docker-text").textContent = `Also update ${stk.length} Docker stack${stk.length === 1 ? "" : "s"} with new images`;
+    $("#upd-docker").checked = false;
+  } else if (stack) {
+    const guest = findTarget(host, vmid);
+    const where = vmid == null ? host : `${guest.type === "vm" ? "VM" : "container"} ${guest.name} (${vmid}) on ${host}`;
+    title = `Update stack ${stack}`;
+    sub = `${t.updates} of ${t.images.length} image${t.images.length === 1 ? "" : "s"} have new versions · ${where}. Runs docker compose pull && up -d.`;
+    $("#upd-override-row").hidden = true;
+    $("#upd-docker-row").hidden = true;
   } else {
     const n = isHost ? (t.host ? t.host.packages.length : 0) : t.packages.length;
     title = isHost ? `Update ${host}` : `Update ${t.name}`;
     sub = `${n} package${n === 1 ? "" : "s"} to update` + (isHost ? ` on the ${({ pve: "Proxmox host", pbs: "Backup Server" })[hostObj.kind] || "server"}` : ` · ${t.type === "vm" ? "VM" : "container"} ${vmid} on ${host}`);
     $("#upd-override-row").hidden = true;
+    $("#upd-docker-row").hidden = true;
   }
   $("#upd-title").textContent = title;
   $("#upd-sub").textContent = sub;
@@ -271,7 +329,9 @@ function openUpdateDialog(host, vmid, all = false) {
   const when = sched || (policy && wins.length) ? "schedule" : "now";
   radios.forEach((r) => (r.checked = r.value === when));
 
-  $("#upd-snap-row").hidden = isHost;
+  $("#upd-snap-row").hidden = isHost || (stack && vmid == null);
+  $("#upd-snap-text").textContent = stack ? `Snapshot the ${findTarget(host, vmid).type === "vm" ? "VM" : "container"} first` : "Take a snapshot first";
+  $("#upd-reboot-row").hidden = !!stack;
   $("#upd-snap").checked = sched ? sched.snapshot : store.get("snapshot", state.snapshot_default);
   $("#upd-reboot").checked = sched ? sched.reboot : policy ? policy.reboot : store.get("reboot", false);
   $("#upd-unschedule").hidden = !sched;
@@ -284,7 +344,7 @@ function syncDialog() {
   const when = document.querySelector('#upd-form input[name="when"]:checked').value;
   $("#upd-go").textContent = when === "now" ? "Update now" : (dlg.all ? "Schedule all" : "Schedule");
   $("#upd-window").closest(".choice").classList.toggle("on", when === "schedule");
-  const isHost = !dlg.all && dlg.vmid == null;
+  const isHost = !dlg.all && dlg.vmid == null && !dlg.stack;
   const warn = $("#upd-warn");
   if (isHost && $("#upd-reboot").checked) {
     const h = findTarget(dlg.host, null);
@@ -300,7 +360,7 @@ $("#upd-cancel").addEventListener("click", () => $("#upd").close());
 
 $("#upd-unschedule").addEventListener("click", async () => {
   try {
-    await api("/api/schedule/cancel", { host: dlg.host, vmid: dlg.vmid });
+    await api("/api/schedule/cancel", { host: dlg.host, vmid: dlg.vmid, stack: dlg.stack });
     $("#upd").close();
     toast("Removed from the maintenance window");
     refresh();
@@ -311,7 +371,7 @@ $("#upd-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const when = document.querySelector('#upd-form input[name="when"]:checked').value;
   const snapshot = !$("#upd-snap-row").hidden && $("#upd-snap").checked;
-  const reboot = $("#upd-reboot").checked;
+  const reboot = !dlg.stack && $("#upd-reboot").checked;
   const window = $("#upd-window").value;
   if (!$("#upd-snap-row").hidden) store.set("snapshot", snapshot);
   store.set("reboot", reboot);
@@ -319,7 +379,8 @@ $("#upd-form").addEventListener("submit", async (e) => {
   go.disabled = true;
   try {
     if (dlg.all) {
-      const r = await api("/api/update-all", { mode: when, window, snapshot, reboot, override: $("#upd-override").checked });
+      const r = await api("/api/update-all", { mode: when, window, snapshot, reboot, override: $("#upd-override").checked,
+        include_docker: !$("#upd-docker-row").hidden && $("#upd-docker").checked });
       const parts = [];
       if (r.jobs.length) parts.push(`Started ${r.jobs.length} update${r.jobs.length === 1 ? "" : "s"}`);
       if (r.scheduled) parts.push(`${r.scheduled} scheduled`);
@@ -327,12 +388,11 @@ $("#upd-form").addEventListener("submit", async (e) => {
       $("#upd").close();
       if (r.jobs.length) openLog(r.jobs[0].id);
     } else if (when === "now") {
-      const job = await api("/api/update", { host: dlg.host, vmid: dlg.vmid, snapshot, reboot });
+      const job = await api("/api/update", { host: dlg.host, vmid: dlg.vmid, snapshot, reboot, stack: dlg.stack });
       $("#upd").close();
-      const t = findTarget(dlg.host, dlg.vmid);
-      openLog(job.id, `Update · ${dlg.vmid == null ? dlg.host : t.name}`);
+      openLog(job.id, `Update · ${job.name}`);
     } else {
-      await api("/api/schedule", { host: dlg.host, vmid: dlg.vmid, snapshot, reboot, window });
+      await api("/api/schedule", { host: dlg.host, vmid: dlg.vmid, snapshot, reboot, window, stack: dlg.stack });
       $("#upd").close();
       toast(`Scheduled: ${$("#upd-window").selectedOptions[0].textContent}`);
     }
@@ -354,7 +414,7 @@ document.addEventListener("click", async (e) => {
     openPkgs.has(k) ? openPkgs.delete(k) : openPkgs.add(k);
     render();
   } else if (t.dataset.dialog) {
-    openUpdateDialog(t.dataset.dialog, t.dataset.vmid ? Number(t.dataset.vmid) : null);
+    openUpdateDialog(t.dataset.dialog, t.dataset.vmid ? Number(t.dataset.vmid) : null, false, t.dataset.stack || null);
   } else if (t.dataset.check) {
     try { const r = await api("/api/check", { host: t.dataset.check }); openLog(r.jobs[0].id, `Check · ${t.dataset.check}`); refresh(); }
     catch (err) { toast(err.message); }

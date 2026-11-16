@@ -16,6 +16,9 @@ A small, self-hosted update dashboard for Proxmox VE hosts and their LXC contain
   and reboot afterwards if the update needs it
 - **Maintenance windows and schedules**: several named windows; give any container, VM or
   host a window, optionally updating automatically in it; one Discord summary per window
+- **Docker Compose stacks** inside containers, VMs and Debian/Ubuntu servers: Patchdeck asks each
+  image's registry (Docker Hub, GHCR, lscr.io, Quay…) whether a newer version exists, without
+  pulling anything, and updates a stack with `docker compose pull && up -d`, now or in a window
 - **Proxmox Backup Server** and plain Debian/Ubuntu servers can be added as hosts too
 - Debian, Ubuntu, Devuan and Alpine guests (Windows VMs and other distros are listed but not updated)
 
@@ -74,6 +77,22 @@ You can still edit the file by hand; see `config.example.yaml` for every option,
 ```bash
 cd /opt/patchdeck && git pull && venv/bin/pip install -r requirements.txt && systemctl restart patchdeck
 ```
+
+## Docker stacks
+
+Any container, VM or Debian/Ubuntu server with Docker and the Compose plugin has its stacks listed
+under it (anything that shows up in `docker compose ls`). Each check compares the digest of every
+local image with the digest of the same tag in its registry:
+
+- **New version**: the tag now points at a different image. **Update…** runs `docker compose pull`
+  and `docker compose up -d` in the stack's folder, then `docker image prune -f` (can be turned off
+  in Settings → General). Snapshots, maintenance windows and auto-update work as for OS updates.
+- **Local build**: images built from a Dockerfile can't be compared and are skipped.
+- **Can't check**: private images, pinned digests, or a registry rate limit. Lookups use `HEAD`
+  requests, which Docker Hub allows about 100 an hour per IP for anonymous clients; a homelab
+  checked a few times a day stays well below that.
+
+Patchdeck needs outbound HTTPS to the registries for this. Turn it off under Settings → General.
 
 ## Security notes
 

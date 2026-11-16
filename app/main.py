@@ -20,7 +20,8 @@ from fastapi.staticfiles import StaticFiles
 
 from . import sshsetup
 from .notify import discord
-from .proxmox import APK_UPGRADE, APT_UPGRADE, HOST_KINDS, Host, family
+from . import registry
+from .proxmox import APK_UPGRADE, APT_UPGRADE, HOST_KINDS, Host, family, stack_update_script
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("patchdeck")
@@ -94,6 +95,8 @@ def effective(raw):
     cfg["schedule"].setdefault("check_times", ["08:00"])
     cfg["schedule"].setdefault("days", list(range(7)))
     cfg["exclude"] = cfg.get("exclude") or []
+    dk = cfg.get("docker") if isinstance(cfg.get("docker"), dict) else {}
+    cfg["docker"] = {"enabled": bool(dk.get("enabled", True)), "prune": bool(dk.get("prune", True))}
     cfg["maintenance"], cfg["schedules"] = normalise_maintenance(cfg)
     cfg["hosts"] = cfg.get("hosts") or []
     if os.environ.get("PATCHDECK_PASSWORD"):
@@ -119,7 +122,7 @@ MAINT_CHANGED = asyncio.Event()
 
 def apply_config():
     """Rebuild everything derived from CFG."""
-    global SSH, KNOWN_HOSTS, KEY_FILE, HOSTS, SNAP, EXCLUDE, DISCORD, WINDOWS, SCHEDULES
+    global SSH, KNOWN_HOSTS, KEY_FILE, HOSTS, SNAP, EXCLUDE, DISCORD, WINDOWS, SCHEDULES, DOCKER
     SSH = CFG["ssh"]
     kh = SSH.get("known_hosts", str(DATA_DIR / "known_hosts"))
     KNOWN_HOSTS = None if kh in ("none", "off", False) else kh
@@ -143,6 +146,7 @@ def apply_config():
             "on_failure": CFG["snapshots"].get("on_failure", "abort")}
     EXCLUDE = {int(v) for v in CFG["exclude"]}
     DISCORD = CFG["discord"]
+    DOCKER = CFG["docker"]
     WINDOWS = CFG["maintenance"]["windows"]
     SCHEDULES = CFG["schedules"]
 
@@ -203,6 +207,7 @@ class Job:
         self.snapshot, self.batch, self.auto = snapshot, batch, auto
         self.quiet = False  # maintenance-window jobs report in one summary instead
         self.reboot = False  # reboot afterwards if the update leaves a reboot pending
+        self.stack = None    # set for a Docker Compose stack update
         self.status = "queued"
         self.summary = ""
         self.lines = []
@@ -230,11 +235,13 @@ class Job:
 
     def public(self):
         return {k: getattr(self, k) for k in
-                ("id", "kind", "host", "vmid", "name", "status", "summary", "created", "started", "finished", "batch")}
+                ("id", "kind", "host", "vmid", "name", "status", "summary", "created", "started", "finished",
+                 "batch", "stack")}
 
     @classmethod
     def restore(cls, d):
         j = cls(d["kind"], d["host"], d.get("vmid"), d.get("name"))
+        j.stack = None
         for k, v in d.items():
             setattr(j, k, v)
         if j.status in ("queued", "running"):
@@ -266,14 +273,45 @@ def spawn(coro):
     return t
 
 
-def active_job(host, vmid):
-    return next((j for j in JOBS.values() if j.host == host and j.vmid == vmid
+def active_job(host, vmid, stack=None):
+    return next((j for j in JOBS.values() if j.host == host and j.vmid == vmid and j.stack == stack
                  and j.kind == "update" and j.status in ("queued", "running")), None)
 
 
 def find_ct(host, vmid):
     h = STATE["hosts"].get(host) or {}
     return next((c for c in h.get("containers", []) if c["vmid"] == vmid), None)
+
+
+def find_target(host, vmid):
+    """The state entry for a guest, or the host's own entry when vmid is None."""
+    return STATE["hosts"].get(host, {}).get("host") if vmid is None else find_ct(host, vmid)
+
+
+def find_stack(host, vmid, stack):
+    t = find_target(host, vmid) or {}
+    return next((st for st in t.get("stacks") or [] if st["name"] == stack), None)
+
+
+def target_kind(host, vmid):
+    return "host" if vmid is None else (find_ct(host, vmid) or {}).get("type", "lxc")
+
+
+def target_name(host, vmid, stack=None):
+    base = f"{host} (host)" if vmid is None else (find_ct(host, vmid) or {}).get("name", str(vmid))
+    return f"{base} / {stack}" if stack else base
+
+
+async def annotate_docker(entries):
+    """Ask registries whether each stack's images have newer versions."""
+    targets = [e for e in entries if e and e.get("stacks")]
+    if not targets or not DOCKER["enabled"]:
+        return
+    reg = registry.Registry()
+    try:
+        await asyncio.gather(*(registry.annotate(e["stacks"], reg) for e in targets))
+    finally:
+        await reg.close()
 
 
 # ---------------------------------------------------------------- checks
@@ -285,12 +323,17 @@ async def run_check(job):
         job.log(f"Connecting to {h.address}…")
         try:
             result = await h.check(exclude=EXCLUDE)
+            if DOCKER["enabled"]:
+                job.log("Checking Docker images against their registries…")
+                await annotate_docker([result["host"]] + result["containers"])
             STATE["hosts"][job.host] = result
             save_state()
             n_ct = sum(len(c["packages"]) for c in result["containers"])
             for c in result["containers"]:
                 detail = c["error"] or (c["status"] if c["status"] != "running" else f"{len(c['packages'])} updates")
                 job.log(f"  {c['vmid']:>5}  {c['name']:<24} {detail}")
+                for st in c.get("stacks") or []:
+                    job.log(f"         🐳 {st['name']:<21} {st.get('updates', 0)} image update(s)")
             job.finish("success", f"host {len(result['host']['packages'])} · containers {n_ct} updates")
         except Exception as e:
             prev = STATE["hosts"].get(job.host, {})
@@ -325,19 +368,39 @@ def pending_targets():
     return out
 
 
+def pending_stacks():
+    """(host, vmid, stack name, display name, number of images with updates)."""
+    out = []
+    for hname in HOSTS:
+        h = STATE["hosts"].get(hname) or {}
+        for vmid, t in [(None, h.get("host") or {})] + [(c["vmid"], c) for c in h.get("containers", [])]:
+            if vmid in EXCLUDE or (vmid is not None and t.get("status") != "running"):
+                continue
+            for st in t.get("stacks") or []:
+                if st.get("updates"):
+                    out.append((hname, vmid, st["name"], target_name(hname, vmid, st["name"]), st["updates"]))
+    return out
+
+
 async def notify_check():
     mode = DISCORD.get("on_check", "always")
     if mode == "off" or not DISCORD.get("webhook"):
         return
     targets = pending_targets()
+    stacks = pending_stacks() if DOCKER["enabled"] else []
     sig = sorted(f"{h}:{v}:{p['name']}:{p['to']}" for h, v, _, pk in targets for p in pk)
-    if not targets or (mode == "new" and set(sig) <= set(STATE["notified"])):
+    sig += sorted(f"{h}:{v}:{st}:{i['ref']}:{i.get('remote')}" for h, v, st, _, _ in stacks
+                  for i in (find_stack(h, v, st) or {}).get("images", []) if i.get("status") == "update")
+    if not (targets or stacks) or (mode == "new" and set(sig) <= set(STATE["notified"])):
         return
     total = sum(len(pk) for *_, pk in targets)
-    lines = [f"🔔 **{total} updates available** across {len(targets)} target(s)"]
+    lines = [f"🔔 **{total} updates available** across {len(targets)} target(s)" if targets
+             else "🔔 **Docker image updates available**"]
     for h, vmid, name, pk in targets:
         where = f"`{h}`" if vmid is None else f"`{h}/{vmid}`"
         lines.append(f"• **{name}** {where}: {len(pk)}")
+    for h, vmid, st, name, n in stacks:
+        lines.append(f"🐳 **{name}** `{h}`: {n} image{'s' if n != 1 else ''}")
     errors = [f"{n}/{c['name']}" for n, h in STATE["hosts"].items()
               for c in h.get("containers", []) if c.get("error")]
     errors += [n for n, h in STATE["hosts"].items() if h.get("error")]
@@ -352,7 +415,67 @@ async def notify_check():
 
 # ---------------------------------------------------------------- updates
 
+async def take_snapshot(job, h, kind):
+    job.log("Taking snapshot…")
+    try:
+        snap = await h.snapshot(job.vmid, kind)
+        job.log(f"Snapshot created: {snap}")
+    except Exception as e:
+        job.log(f"Snapshot failed: {e}")
+        if SNAP["on_failure"] == "abort":
+            raise RuntimeError("Snapshot failed, update aborted (change this under Settings → Snapshots)")
+        job.log("Continuing without a snapshot")
+        job.snapshot = False
+
+
+async def prune_snapshots(job, h, kind):
+    removed = await h.prune_snapshots(job.vmid, SNAP["keep"], kind)
+    if removed:
+        job.log(f"Removed old snapshots: {', '.join(removed)}")
+
+
+async def refresh_docker(host, vmid):
+    h = HOSTS[host]
+    d = await h.check_docker(target_kind(host, vmid), vmid)
+    await annotate_docker([d])
+    target = find_target(host, vmid)
+    if target is not None:
+        target["stacks"], target["docker_error"] = d.get("stacks"), d.get("docker_error")
+        save_state()
+
+
+async def run_stack_update(job):
+    h = HOSTS[job.host]
+    async with HOST_LOCKS[job.host]:
+        job.start()
+        try:
+            st = find_stack(job.host, job.vmid, job.stack)
+            if not st:
+                raise RuntimeError("Stack not in the last check; run a check first")
+            kind = target_kind(job.host, job.vmid)
+            before = st.get("updates", 0)
+            if job.snapshot and kind != "host":
+                await take_snapshot(job, h, kind)
+            job.log(f"$ docker compose pull && docker compose up -d   ({st['name']})")
+            rc = await h.run_in(kind, job.vmid, stack_update_script(st["name"], st["files"], DOCKER["prune"]), job.log)
+            if rc == 0 and job.snapshot and kind != "host":
+                await prune_snapshots(job, h, kind)
+            job.log("Re-checking images…")
+            await refresh_docker(job.host, job.vmid)
+            after = find_stack(job.host, job.vmid, job.stack) or {}
+            if rc != 0:
+                job.finish("failed", f"exit code {rc}")
+            else:
+                job.finish("success", f"{before} → {after.get('updates', 0)} image update(s)")
+        except Exception as e:
+            job.log(f"ERROR: {e}")
+            job.finish("failed", str(e))
+    await notify_update(job)
+
+
 async def run_update(job):
+    if job.stack:
+        return await run_stack_update(job)
     h = HOSTS[job.host]
     async with HOST_LOCKS[job.host]:
         job.start()
@@ -372,16 +495,7 @@ async def run_update(job):
                     raise RuntimeError(f"Unsupported OS: {ct['os']}")
                 before = len(ct["packages"])
                 if job.snapshot:
-                    job.log("Taking snapshot…")
-                    try:
-                        snap = await h.snapshot(job.vmid, kind)
-                        job.log(f"Snapshot created: {snap}")
-                    except Exception as e:
-                        job.log(f"Snapshot failed: {e}")
-                        if SNAP["on_failure"] == "abort":
-                            raise RuntimeError("Snapshot failed, update aborted (change this under Settings → Snapshots)")
-                        job.log("Continuing without a snapshot")
-                        job.snapshot = False
+                    await take_snapshot(job, h, kind)
                 job.log(f"$ {'apt-get dist-upgrade' if fam == 'apt' else 'apk upgrade'} in {ct['name']}")
                 if kind == "vm":
                     job.log("(VM output arrives through the guest agent every few seconds)")
@@ -389,9 +503,7 @@ async def run_update(job):
                 else:
                     rc = await h.stream(h.upgrade_cmd(job.vmid, fam), job.log)
                 if rc == 0 and job.snapshot:
-                    removed = await h.prune_snapshots(job.vmid, SNAP["keep"], kind)
-                    if removed:
-                        job.log(f"Removed old snapshots: {', '.join(removed)}")
+                    await prune_snapshots(job, h, kind)
             job.log("Re-checking…")
             after = await recheck(job)
             notes = []
@@ -454,18 +566,17 @@ async def notify_update(job):
     await discord(DISCORD["webhook"], "\n".join(l for l in lines if l))
 
 
-def queue_update(host, vmid, snapshot, batch=None, reboot=False):
+def queue_update(host, vmid, snapshot, batch=None, reboot=False, stack=None):
     if host not in HOSTS:
         raise HTTPException(404, "Unknown host")
-    if active_job(host, vmid):
+    if active_job(host, vmid, stack):
         raise HTTPException(409, "An update for this target is already queued or running")
-    name = f"{host} (host)" if vmid is None else (find_ct(host, vmid) or {}).get("name", str(vmid))
-    job = Job("update", host, vmid, name, snapshot=snapshot and vmid is not None, batch=batch)
-    job.reboot = bool(reboot)
+    job = Job("update", host, vmid, target_name(host, vmid, stack), snapshot=snapshot and vmid is not None, batch=batch)
+    job.reboot = bool(reboot) and not stack
+    job.stack = stack
     JOBS[job.id] = job
-    if is_scheduled(host, vmid):  # updating now replaces a pending maintenance-window update
-        STATE["scheduled"] = [i for i in STATE["scheduled"] if not (i["host"] == host and i["vmid"] == vmid)]
-        save_state()
+    if is_scheduled(host, vmid, stack):  # updating now replaces a pending maintenance-window update
+        unschedule(host, vmid, stack)
     spawn(run_update(job))
     return job
 
@@ -511,16 +622,26 @@ async def scheduler():
 
 # ---------------------------------------------------------------- maintenance windows
 
-def target_key(host, vmid):
-    return f"{host}/{'host' if vmid is None else vmid}"
+def target_key(host, vmid, stack=None):
+    return f"{host}/{'host' if vmid is None else vmid}" + (f":{stack}" if stack else "")
 
 
-def is_scheduled(host, vmid):
-    return any(i["host"] == host and i["vmid"] == vmid for i in STATE["scheduled"])
+def _same(i, host, vmid, stack):
+    return i["host"] == host and i["vmid"] == vmid and i.get("stack") == stack
 
 
-def scheduled_item(host, vmid):
-    return next((i for i in STATE["scheduled"] if i["host"] == host and i["vmid"] == vmid), None)
+def is_scheduled(host, vmid, stack=None):
+    return any(_same(i, host, vmid, stack) for i in STATE["scheduled"])
+
+
+def scheduled_item(host, vmid, stack=None):
+    return next((i for i in STATE["scheduled"] if _same(i, host, vmid, stack)), None)
+
+
+def unschedule(host, vmid, stack=None):
+    STATE["scheduled"] = [i for i in STATE["scheduled"] if not _same(i, host, vmid, stack)]
+    save_state()
+    MAINT_CHANGED.set()
 
 
 def window_named(name):
@@ -559,29 +680,31 @@ def window_info(name):
             "end": occ[1].timestamp() if occ else None} if w else None
 
 
-def schedule_target(host, vmid, snapshot, reboot, window=None):
+def schedule_target(host, vmid, snapshot, reboot, window=None, stack=None):
     if host not in HOSTS:
         raise HTTPException(404, "Unknown host")
     if not WINDOWS:
         raise HTTPException(400, "Add a maintenance window in Settings first")
-    window = window or SCHEDULES.get(target_key(host, vmid), {}).get("window") or WINDOWS[0]["name"]
+    window = window or SCHEDULES.get(target_key(host, vmid, stack), {}).get("window") or WINDOWS[0]["name"]
     if not window_named(window):
         raise HTTPException(400, "Unknown maintenance window")
-    if active_job(host, vmid):
+    if active_job(host, vmid, stack):
         raise HTTPException(409, "An update for this target is already running")
-    item = scheduled_item(host, vmid)
+    item = scheduled_item(host, vmid, stack)
     if item is None:
-        name = f"{host} (host)" if vmid is None else (find_ct(host, vmid) or {}).get("name", str(vmid))
-        item = {"host": host, "vmid": vmid, "name": name, "added": time.time()}
+        item = {"host": host, "vmid": vmid, "stack": stack, "name": target_name(host, vmid, stack),
+                "added": time.time()}
         STATE["scheduled"].append(item)
-    item.update(window=window, snapshot=bool(snapshot) and vmid is not None, reboot=bool(reboot))
+    item.update(window=window, snapshot=bool(snapshot) and vmid is not None, reboot=bool(reboot) and not stack)
     save_state()
     MAINT_CHANGED.set()
 
 
 def split_key(key):
+    """'pve1/105:immich' -> ('pve1', 105, 'immich'); 'pbs/host' -> ('pbs', None, None)."""
     host, _, rest = key.rpartition("/")
-    return host, (None if rest == "host" else int(rest))
+    target, _, stack = rest.partition(":")
+    return host, (None if target == "host" else int(target)), (stack or None)
 
 
 async def queue_auto_updates(w):
@@ -596,15 +719,18 @@ async def queue_auto_updates(w):
         JOBS[j.id] = j
     await asyncio.gather(*(run_check(j) for j in jobs))
     for k in keys:
-        host, vmid = split_key(k)
-        if host not in HOSTS or is_scheduled(host, vmid) or active_job(host, vmid):
+        host, vmid, stack = split_key(k)
+        if host not in HOSTS or is_scheduled(host, vmid, stack) or active_job(host, vmid, stack):
             continue
-        target = STATE["hosts"].get(host, {}).get("host") if vmid is None else find_ct(host, vmid)
-        if target and target.get("packages") and (vmid is None or target.get("status") == "running"):
-            name = f"{host} (host)" if vmid is None else target["name"]
-            STATE["scheduled"].append({"host": host, "vmid": vmid, "name": name, "added": time.time(),
-                                       "window": w["name"], "snapshot": SNAP["enabled"] and vmid is not None,
-                                       "reboot": SCHEDULES[k]["reboot"], "auto": True})
+        target = find_target(host, vmid)
+        if not target or (vmid is not None and target.get("status") != "running"):
+            continue
+        pending = (find_stack(host, vmid, stack) or {}).get("updates") if stack else len(target.get("packages") or [])
+        if pending:
+            STATE["scheduled"].append({"host": host, "vmid": vmid, "stack": stack, "name": target_name(host, vmid, stack),
+                                       "added": time.time(), "window": w["name"],
+                                       "snapshot": SNAP["enabled"] and vmid is not None,
+                                       "reboot": SCHEDULES[k]["reboot"] and not stack, "auto": True})
     save_state()
 
 
@@ -629,21 +755,25 @@ async def run_maintenance(w, end):
     log.info("Maintenance window %s: %d update(s)", w["name"], len(items))
 
     async def per_host(host, its):
-        its.sort(key=lambda i: i["vmid"] is None)  # guests first, the host itself (may reboot) last
+        # Docker stacks first, then OS updates; the host itself (may reboot) last
+        its.sort(key=lambda i: (i["vmid"] is None, not i.get("stack")))
         for it in its:
             if dt.datetime.now() >= end:
                 return  # window over: leave the rest for next time
             STATE["scheduled"] = [x for x in STATE["scheduled"] if x is not it]
             save_state()
-            if host not in HOSTS or active_job(host, it["vmid"]):
+            stack = it.get("stack")
+            if host not in HOSTS or active_job(host, it["vmid"], stack):
                 continue
-            pending = (STATE["hosts"].get(host, {}).get("host", {}) if it["vmid"] is None
-                       else find_ct(host, it["vmid"]) or {}).get("packages")
-            if pending == []:
+            if stack:
+                pending = (find_stack(host, it["vmid"], stack) or {}).get("updates")
+            else:
+                pending = len((find_target(host, it["vmid"]) or {}).get("packages") or []) or None
+            if not pending:
                 skipped.append(it["name"])
                 continue
             job = Job("update", host, it["vmid"], it["name"], snapshot=it.get("snapshot"), batch=batch)
-            job.quiet, job.reboot = True, bool(it.get("reboot"))
+            job.quiet, job.reboot, job.stack = True, bool(it.get("reboot")), stack
             JOBS[job.id] = job
             await run_update(job)
             done.append(job)
@@ -781,13 +911,16 @@ async def get_state():
             c["scheduled"] = sched_public(name, c["vmid"])
             c["schedule"] = SCHEDULES.get(target_key(name, c["vmid"]))
             c.setdefault("type", "lxc")
+            c["stacks"] = deco_stacks(name, c["vmid"], c.get("stacks"))
             containers.append(c)
         hj = active_job(name, None)
         hosts.append({
             "name": name, "address": h.address, "node": node, "kind": h.kind,
             "scheduled": sched_public(name, None),
             "schedule": SCHEDULES.get(target_key(name, None)),
-            "host": s.get("host"), "containers": containers,
+            "host": ({**s["host"], "stacks": deco_stacks(name, None, s["host"].get("stacks"))}
+                     if s.get("host") else None),
+            "containers": containers,
             "checked_at": s.get("checked_at"), "error": s.get("error"),
             "console": fill(h.host_console_url or default_host, node=node, address=h.address, host=name),
             "job": hj.public() if hj else None,
@@ -801,8 +934,20 @@ async def get_state():
             "scheduled_count": len(STATE["scheduled"])}
 
 
-def sched_public(host, vmid):
-    item = scheduled_item(host, vmid)
+def deco_stacks(host, vmid, stacks):
+    if stacks is None or not DOCKER["enabled"]:
+        return None
+    out = []
+    for st in stacks:
+        j = active_job(host, vmid, st["name"])
+        out.append({**st, "job": j.public() if j else None,
+                    "scheduled": sched_public(host, vmid, st["name"]),
+                    "schedule": SCHEDULES.get(target_key(host, vmid, st["name"]))})
+    return out
+
+
+def sched_public(host, vmid, stack=None):
+    item = scheduled_item(host, vmid, stack)
     if not item:
         return None
     return {"window": window_info(item_window(item)), "reboot": item.get("reboot", False),
@@ -814,7 +959,7 @@ async def api_schedule(request: Request):
     b = await _body(request)
     vmid = b.get("vmid")
     schedule_target(b.get("host"), int(vmid) if vmid is not None else None,
-                    bool(b.get("snapshot")), bool(b.get("reboot")), b.get("window"))
+                    bool(b.get("snapshot")), bool(b.get("reboot")), b.get("window"), b.get("stack") or None)
     return {"ok": True}
 
 
@@ -822,10 +967,7 @@ async def api_schedule(request: Request):
 async def api_schedule_cancel(request: Request):
     b = await _body(request)
     vmid = b.get("vmid")
-    vmid = int(vmid) if vmid is not None else None
-    STATE["scheduled"] = [i for i in STATE["scheduled"] if not (i["host"] == b.get("host") and i["vmid"] == vmid)]
-    save_state()
-    MAINT_CHANGED.set()
+    unschedule(b.get("host"), int(vmid) if vmid is not None else None, b.get("stack") or None)
     return {"ok": True}
 
 
@@ -849,7 +991,7 @@ async def api_update(request: Request):
     body = await _body(request)
     vmid = body.get("vmid")
     job = queue_update(body.get("host"), int(vmid) if vmid is not None else None,
-                       bool(body.get("snapshot")), reboot=bool(body.get("reboot")))
+                       bool(body.get("snapshot")), reboot=bool(body.get("reboot")), stack=body.get("stack") or None)
     return job.public()
 
 
@@ -861,21 +1003,24 @@ async def api_update_all(request: Request):
     batch = secrets.token_hex(4)
     snap, reboot = bool(body.get("snapshot")), bool(body.get("reboot"))
     jobs, scheduled = [], 0
-    for host, vmid, _, _ in pending_targets():
+    targets = [(h, v, None) for h, v, _, _ in pending_targets()]
+    if body.get("include_docker") and DOCKER["enabled"]:
+        targets += [(h, v, st) for h, v, st, _, _ in pending_stacks()]
+    for host, vmid, stack in targets:
         if vmid is None and not body.get("include_hosts"):
             continue
         ct = find_ct(host, vmid) if vmid is not None else None
         if ct and ct.get("status") != "running":
             continue
-        if active_job(host, vmid):
+        if active_job(host, vmid, stack):
             continue
-        has_policy = target_key(host, vmid) in SCHEDULES
+        has_policy = target_key(host, vmid, stack) in SCHEDULES
         if body.get("mode") == "schedule" or (has_policy and not body.get("override") and WINDOWS):
             window = None if has_policy else body.get("window")
-            schedule_target(host, vmid, snap, reboot, window)
+            schedule_target(host, vmid, snap, reboot, window, stack)
             scheduled += 1
-        elif not is_scheduled(host, vmid) or body.get("override"):
-            jobs.append(queue_update(host, vmid, snap, batch=batch, reboot=reboot).public())
+        elif not is_scheduled(host, vmid, stack) or body.get("override"):
+            jobs.append(queue_update(host, vmid, snap, batch=batch, reboot=reboot, stack=stack).public())
     return {"jobs": jobs, "scheduled": scheduled}
 
 
@@ -973,10 +1118,14 @@ def settings_payload():
                     "on_check": DISCORD.get("on_check", "always"),
                     "on_update": bool(DISCORD.get("on_update", True))},
         "snapshots": SNAP,
+        "docker": DOCKER,
         "windows": [{**w, "next_start": (window_info(w["name"]) or {}).get("start")} for w in WINDOWS],
         "schedules": SCHEDULES,
-        "targets": [{"host": n, "kind": h.kind, "containers": [
-            {"vmid": c["vmid"], "name": c["name"], "type": c.get("type", "lxc")}
+        "targets": [{"host": n, "kind": h.kind,
+                     "stacks": [st["name"] for st in (STATE["hosts"].get(n, {}).get("host") or {}).get("stacks") or []],
+                     "containers": [
+            {"vmid": c["vmid"], "name": c["name"], "type": c.get("type", "lxc"),
+             "stacks": [st["name"] for st in c.get("stacks") or []]}
             for c in STATE["hosts"].get(n, {}).get("containers", []) if c["vmid"] not in EXCLUDE]}
             for n, h in HOSTS.items()],
         "host_kinds": HOST_KINDS,
@@ -1059,6 +1208,8 @@ async def api_settings_save(request: Request):
                                     "reboot": bool(pol.get("reboot"))}
         RAW["schedules"] = scheds
         RAW.pop("maintenance_only", None)
+    if "docker" in b:
+        RAW["docker"] = {"enabled": bool(b["docker"].get("enabled", True)), "prune": bool(b["docker"].get("prune", True))}
     if "base_url" in b:
         RAW["base_url"] = str(b["base_url"]).strip()
     if "exclude" in b:

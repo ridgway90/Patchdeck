@@ -49,6 +49,7 @@ maintenance:
 schedules:
   pve1/105: {window: Weekend nights, auto: true, reboot: true}
   pbs/host: {window: Weekend nights, auto: false, reboot: true}
+  pve1/201:immich: {window: Weeknights, auto: true}   # a Docker stack: host/vmid:stack
 
 discord:
   webhook: ""                     # or set DISCORD_WEBHOOK
@@ -59,6 +60,10 @@ snapshots:
   enabled: true                   # default for the "Snapshot first" toggle
   keep: 3                         # pre-update snapshots kept per container
   on_failure: abort               # abort | continue (e.g. storage without snapshot support)
+
+docker:
+  enabled: true                   # check Compose stacks for new image versions
+  prune: true                     # docker image prune -f after updating a stack
 
 # Container IDs to hide entirely
 exclude: []

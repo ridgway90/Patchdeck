@@ -43,6 +43,58 @@ SNAP_NAME = re.compile(r"(pre-update-\d{8}-\d{6})")
 RC_MARK = "__PATCHDECK_RC__"
 
 
+DOCKER_LS = ("command -v docker >/dev/null 2>&1 || { echo __NODOCKER__; exit 0; }; "
+             "docker compose version >/dev/null 2>&1 || { echo __NOCOMPOSE__; exit 0; }; "
+             "docker compose ls --all --format json")
+
+
+def compose_args(name, files):
+    args = ["-p", shlex.quote(name)]
+    for f in files:
+        args += ["-f", shlex.quote(f)]
+    return " ".join(args)
+
+
+def images_script(stacks):
+    """For each stack: its image refs, and the registry digests of the local copies."""
+    parts = []
+    for st in stacks:
+        parts.append(
+            f"echo {shlex.quote('__STACK__ ' + st['name'])}; "
+            f"docker compose {compose_args(st['name'], st['files'])} config --images 2>/dev/null | sort -u | "
+            "while read -r img; do echo \"__IMG__ $img\"; "
+            "docker image inspect --format '{{json .RepoDigests}}' \"$img\" 2>/dev/null || echo __MISSING__; done")
+    return "; ".join(parts)
+
+
+def parse_images(out, stacks):
+    by_name = {st["name"]: st for st in stacks}
+    cur, img = None, None
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("__STACK__ "):
+            cur, img = by_name.get(line[10:]), None
+        elif line.startswith("__IMG__ ") and cur is not None:
+            img = {"ref": line[8:], "digests": [], "missing": False}
+            cur["images"].append(img)
+        elif img is not None and line == "__MISSING__":
+            img["missing"] = True
+        elif img is not None and line.startswith("["):
+            try:
+                img["digests"] = [d.split("@", 1)[1] for d in json.loads(line) if "@" in d]
+            except ValueError:
+                pass
+
+
+def stack_update_script(name, files, prune=True):
+    args = compose_args(name, files)
+    script = (f"cd {shlex.quote(os.path.dirname(files[0]) or '/')} && "
+              f"docker compose --ansi never {args} pull && docker compose --ansi never {args} up -d")
+    if prune:
+        script += " && docker image prune -f"
+    return script
+
+
 def family(ostype):
     if ostype in APT_FAMILY:
         return "apt"
@@ -103,6 +155,51 @@ class Host:
             raise RuntimeError(f"`{cmd.split(' --')[0][:60]}` failed: {err[-1] if err else r.exit_status}")
         return r.stdout or ""
 
+    # ---------- running things in a target (host, container or VM) ----------
+
+    async def _exec(self, conn, kind, vmid, script, timeout=300):
+        if kind == "vm":
+            _, out, _ = await self._guest_exec(conn, vmid, script, timeout)
+            return out
+        return await self._run(conn, ct_cmd(vmid, script) if kind == "lxc" else script, timeout=timeout)
+
+    async def run_in(self, kind, vmid, script, on_line):
+        """Run a long command in a target, streaming its output. Returns the exit code."""
+        if kind == "vm":
+            return await self.run_vm(vmid, script, on_line)
+        return await self.stream(ct_cmd(vmid, script) if kind == "lxc" else script, on_line)
+
+    async def _docker(self, conn, kind, vmid):
+        """Compose stacks in a target with their images, or None when Docker isn't installed."""
+        out = await self._exec(conn, kind, vmid, DOCKER_LS, 60)
+        if "__NODOCKER__" in out:
+            return None
+        if "__NOCOMPOSE__" in out:
+            return {"stacks": [], "error": "Docker is installed but the Compose plugin isn't (docker compose)"}
+        listed = json.loads(out.strip() or "[]")
+        stacks = [{"name": st["Name"], "status": st.get("Status", ""),
+                   "files": [f for f in st.get("ConfigFiles", "").split(",") if f], "images": []}
+                  for st in listed]
+        stacks = [st for st in stacks if st["files"]]
+        if stacks:
+            parse_images(await self._exec(conn, kind, vmid, images_script(stacks), 180), stacks)
+        return {"stacks": stacks, "error": None}
+
+    async def _add_docker(self, conn, entry, kind, vmid):
+        try:
+            d = await self._docker(conn, kind, vmid)
+        except Exception as e:
+            entry["stacks"], entry["docker_error"] = [], f"Couldn't read Docker stacks: {e}"
+            return
+        entry["stacks"] = d["stacks"] if d else None
+        entry["docker_error"] = d["error"] if d else None
+
+    async def check_docker(self, kind, vmid):
+        entry = {}
+        async with self._connect() as conn:
+            await self._add_docker(conn, entry, kind, vmid)
+        return entry
+
     # ---------- checks ----------
 
     async def _check_self(self, conn):
@@ -128,7 +225,8 @@ class Host:
     def _entry(g, kind):
         return {"vmid": int(g["vmid"]), "type": kind, "name": g.get("name") or str(g["vmid"]),
                 "status": g.get("status"), "os": None, "packages": [], "reboot": False,
-                "error": None, "warning": None, "checked_at": time.time()}
+                "error": None, "warning": None, "checked_at": time.time(),
+                "stacks": None, "docker_error": None}
 
     @staticmethod
     def _fill(entry, fam, out):
@@ -153,6 +251,7 @@ class Host:
                 return entry
             listing_cmd = APT_LIST if fam == "apt" else APK_LIST
             self._fill(entry, fam, await self._run(conn, ct_cmd(vmid, f"{listing_cmd}; echo __REBOOT__; {CT_REBOOT}")))
+            await self._add_docker(conn, entry, "lxc", vmid)
         except Exception as e:  # one broken container should not fail the whole host
             entry["error"] = str(e)
         return entry
@@ -190,6 +289,7 @@ class Host:
             listing_cmd = APT_LIST if fam == "apt" else APK_LIST
             _, out, _ = await self._guest_exec(conn, vmid, f"{listing_cmd}; echo __REBOOT__; {CT_REBOOT}")
             self._fill(entry, fam, out)
+            await self._add_docker(conn, entry, "vm", vmid)
         except Exception as e:
             entry["error"] = str(e)
         return entry
@@ -210,7 +310,10 @@ class Host:
         async with self._connect() as conn:
             if self.kind != "pve":
                 node = (await self._run(conn, "hostname", timeout=15)).strip()
-                return {"node": node, "host": await self._check_self(conn), "containers": [],
+                host_info = await self._check_self(conn)
+                if self.kind == "debian":
+                    await self._add_docker(conn, host_info, "host", None)
+                return {"node": node, "host": host_info, "containers": [],
                         "checked_at": time.time(), "error": None}
             host_info = await self._check_self(conn)
             node, guests = await self._guests(conn)
