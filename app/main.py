@@ -2,10 +2,13 @@
 import asyncio
 import base64
 import contextlib
+import copy
 import datetime as dt
 import json
 import logging
 import os
+import re
+import shutil
 import secrets
 import time
 from pathlib import Path
@@ -15,6 +18,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+from . import sshsetup
 from .notify import discord
 from .proxmox import Host, family
 
@@ -28,49 +32,94 @@ STATIC = Path(__file__).parent / "static"
 
 
 # ---------------------------------------------------------------- config
+# config.yaml is the source of truth. The Settings page edits it (RAW) and the app reloads
+# the derived values (CFG and the globals below) without a restart. Env vars override secrets.
 
-def load_config():
-    cfg = yaml.safe_load(CONFIG_PATH.read_text()) or {}
-    cfg.setdefault("auth", {})
-    cfg.setdefault("ssh", {})
-    cfg.setdefault("schedule", {}).setdefault("check_times", ["08:00"])
-    cfg.setdefault("discord", {})
-    cfg.setdefault("snapshots", {})
-    cfg.setdefault("exclude", [])
+TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+
+
+def read_raw():
+    return yaml.safe_load(CONFIG_PATH.read_text()) or {}
+
+
+def effective(raw):
+    cfg = copy.deepcopy(raw)
+    for key in ("auth", "ssh", "schedule", "discord", "snapshots"):
+        if not isinstance(cfg.get(key), dict):
+            cfg[key] = {}
+    cfg["schedule"].setdefault("check_times", ["08:00"])
+    cfg["schedule"].setdefault("days", list(range(7)))
+    cfg["exclude"] = cfg.get("exclude") or []
+    cfg["hosts"] = cfg.get("hosts") or []
     if os.environ.get("PATCHDECK_PASSWORD"):
         cfg["auth"]["password"] = os.environ["PATCHDECK_PASSWORD"]
     if os.environ.get("DISCORD_WEBHOOK"):
         cfg["discord"]["webhook"] = os.environ["DISCORD_WEBHOOK"]
     if not cfg["auth"].get("password") and not cfg["auth"].get("disabled"):
         raise SystemExit("Set auth.password in config.yaml (or PATCHDECK_PASSWORD).")
-    if not cfg.get("hosts"):
-        raise SystemExit("Add at least one entry under hosts: in config.yaml.")
+    # YAML reads an unquoted 18:30 as the number 1110 (minutes); turn it back into "18:30".
+    cfg["schedule"]["check_times"] = [f"{t // 60:02d}:{t % 60:02d}" if isinstance(t, int) else str(t)
+                                      for t in cfg["schedule"]["check_times"] or []]
+    for t in cfg["schedule"]["check_times"]:
+        if not TIME_RE.match(str(t)):
+            raise ValueError(f"Invalid check time {t!r}, use HH:MM")
     return cfg
 
 
-CFG = load_config()
-SSH = CFG["ssh"]
-KNOWN_HOSTS = SSH.get("known_hosts", str(DATA_DIR / "known_hosts"))
-if KNOWN_HOSTS in ("none", "off", False):
-    log.warning("SSH host key checking is DISABLED (ssh.known_hosts: none)")
-    KNOWN_HOSTS = None
+RAW = read_raw()
+CFG = effective(RAW)
+HOSTS = {}
+HOST_LOCKS = {}
+SCHEDULE_CHANGED = asyncio.Event()
 
-HOSTS = {
-    h["name"]: Host(
-        name=h["name"], address=h["address"], port=h.get("port", 22),
-        user=h.get("user", SSH.get("user", "root")),
-        key_file=h.get("key_file", SSH.get("key_file", str(DATA_DIR / "id_ed25519"))),
-        known_hosts=KNOWN_HOSTS,
-        console_url=h.get("console_url", CFG.get("console_url")),
-        host_console_url=h.get("host_console_url", CFG.get("host_console_url")),
-    )
-    for h in CFG["hosts"]
-}
-SNAP = {"enabled": CFG["snapshots"].get("enabled", True),
-        "keep": int(CFG["snapshots"].get("keep", 3)),
-        "on_failure": CFG["snapshots"].get("on_failure", "abort")}
-EXCLUDE = {int(v) for v in CFG["exclude"]}
-DISCORD = CFG["discord"]
+
+def apply_config():
+    """Rebuild everything derived from CFG."""
+    global SSH, KNOWN_HOSTS, KEY_FILE, HOSTS, SNAP, EXCLUDE, DISCORD
+    SSH = CFG["ssh"]
+    kh = SSH.get("known_hosts", str(DATA_DIR / "known_hosts"))
+    KNOWN_HOSTS = None if kh in ("none", "off", False) else kh
+    KEY_FILE = SSH.get("key_file", str(DATA_DIR / "id_ed25519"))
+    HOSTS = {
+        h["name"]: Host(
+            name=h["name"], address=h["address"], port=int(h.get("port", 22)),
+            user=h.get("user", SSH.get("user", "root")),
+            key_file=h.get("key_file", KEY_FILE),
+            known_hosts=KNOWN_HOSTS,
+            console_url=h.get("console_url", CFG.get("console_url")),
+            host_console_url=h.get("host_console_url", CFG.get("host_console_url")),
+        )
+        for h in CFG["hosts"]
+    }
+    for name in HOSTS:
+        HOST_LOCKS.setdefault(name, asyncio.Lock())
+    SNAP = {"enabled": bool(CFG["snapshots"].get("enabled", True)),
+            "keep": int(CFG["snapshots"].get("keep", 3)),
+            "on_failure": CFG["snapshots"].get("on_failure", "abort")}
+    EXCLUDE = {int(v) for v in CFG["exclude"]}
+    DISCORD = CFG["discord"]
+
+
+apply_config()
+if KNOWN_HOSTS is None:
+    log.warning("SSH host key checking is DISABLED (ssh.known_hosts: none)")
+
+
+def save_config():
+    """Validate RAW, write it to config.yaml (keeping a one-time backup), and reload."""
+    global CFG
+    cfg = effective(RAW)
+    backup = CONFIG_PATH.with_name(CONFIG_PATH.name + ".bak")
+    if CONFIG_PATH.exists() and not backup.exists():
+        shutil.copy2(CONFIG_PATH, backup)
+    tmp = CONFIG_PATH.with_suffix(".tmp")
+    tmp.write_text("# Managed by Patchdeck's Settings page; comments are not preserved.\n"
+                   + yaml.safe_dump(RAW, sort_keys=False, allow_unicode=True))
+    os.chmod(tmp, 0o600)
+    tmp.replace(CONFIG_PATH)
+    CFG = cfg
+    apply_config()
+    SCHEDULE_CHANGED.set()
 
 
 # ---------------------------------------------------------------- state
@@ -147,7 +196,6 @@ JOBS = {}
 for d in _load(JOBS_FILE, []):
     j = Job.restore(d)
     JOBS[j.id] = j
-HOST_LOCKS = {name: asyncio.Lock() for name in HOSTS}
 TASKS = set()
 
 
@@ -338,19 +386,37 @@ def queue_update(host, vmid, snapshot, batch=None):
 
 # ---------------------------------------------------------------- scheduler
 
+def next_run(now=None):
+    sched = CFG["schedule"]
+    times = sorted({tuple(map(int, t.split(":"))) for t in sched.get("check_times") or []})
+    days = {int(d) for d in sched.get("days", range(7))}
+    if not times or not days or not HOSTS:
+        return None
+    now = now or dt.datetime.now()
+    for offset in range(8):
+        day = (now + dt.timedelta(days=offset)).date()
+        if day.weekday() not in days:
+            continue
+        for hh, mm in times:
+            c = dt.datetime.combine(day, dt.time(hh, mm))
+            if c > now:
+                return c
+    return None
+
+
 async def scheduler():
-    times = [tuple(map(int, t.split(":"))) for t in CFG["schedule"]["check_times"]]
-    if not STATE["hosts"]:
+    if not STATE["hosts"] and HOSTS:
         await check_all(auto=False)
     while True:
-        now = dt.datetime.now()
-        candidates = []
-        for hh, mm in times:
-            c = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-            candidates.append(c if c > now else c + dt.timedelta(days=1))
-        nxt = min(candidates)
-        STATE["next_check"] = nxt.timestamp()
-        await asyncio.sleep(max(1, (nxt - now).total_seconds()))
+        SCHEDULE_CHANGED.clear()
+        nxt = next_run()
+        STATE["next_check"] = nxt.timestamp() if nxt else None
+        wait = max(1, (nxt - dt.datetime.now()).total_seconds()) if nxt else None
+        try:
+            await asyncio.wait_for(SCHEDULE_CHANGED.wait(), timeout=wait)
+            continue  # settings changed: work out the next run again
+        except asyncio.TimeoutError:
+            pass
         try:
             await check_all(auto=True)
         except Exception:
@@ -424,6 +490,8 @@ async def get_state():
         default_host = f"https://{h.address}:8006/?console=shell&xtermjs=1&node={{node}}"
         containers = []
         for c in s.get("containers", []):
+            if c["vmid"] in EXCLUDE:
+                continue
             c = dict(c)
             c["console"] = fill(h.console_url or default_ct, vmid=c["vmid"], node=node,
                                 name=c["name"], address=h.address, host=name)
@@ -530,3 +598,235 @@ async def _body(request):
         return await request.json()
     except Exception:
         return {}
+
+
+# ---------------------------------------------------------------- settings
+
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$")
+ADDR_RE = re.compile(r"^[A-Za-z0-9._:%\-]{1,253}$")
+KEY_FILES = {"ssh-ed25519": "ed25519", "ssh-rsa": "rsa", "rsa-sha2-256": "rsa", "rsa-sha2-512": "rsa"}
+
+
+def host_busy(name):
+    return any(j.host == name and j.status in ("queued", "running") for j in JOBS.values())
+
+
+def get_host(body):
+    name = body.get("name")
+    if name not in HOSTS:
+        raise HTTPException(404, "Unknown host")
+    return HOSTS[name]
+
+
+def bad(msg):
+    raise HTTPException(400, msg)
+
+
+def settings_payload():
+    pub = sshsetup.public_key(KEY_FILE)
+    nxt = next_run()
+    return {
+        "hosts": [{
+            "name": h.name, "address": h.address, "port": h.port, "user": h.user,
+            "trusted": sshsetup.is_trusted(KNOWN_HOSTS, h.address, h.port) if KNOWN_HOSTS else None,
+            "busy": host_busy(h.name),
+            "connected": bool(STATE["hosts"].get(h.name, {}).get("checked_at"))
+                         and not STATE["hosts"].get(h.name, {}).get("error"),
+        } for h in HOSTS.values()],
+        "key": {"path": KEY_FILE, "public": pub,
+                "authorize_cmd": sshsetup.authorize_command(pub) if pub else None},
+        "host_key_checking": KNOWN_HOSTS is not None,
+        "schedule": {"check_times": CFG["schedule"]["check_times"],
+                     "days": CFG["schedule"]["days"],
+                     "next": nxt.timestamp() if nxt else None},
+        "discord": {"webhook_set": bool(DISCORD.get("webhook")),
+                    "from_env": bool(os.environ.get("DISCORD_WEBHOOK")),
+                    "on_check": DISCORD.get("on_check", "always"),
+                    "on_update": bool(DISCORD.get("on_update", True))},
+        "snapshots": SNAP,
+        "base_url": CFG.get("base_url") or "",
+        "exclude": sorted(EXCLUDE),
+    }
+
+
+@app.get("/api/settings")
+async def api_settings():
+    return settings_payload()
+
+
+@app.post("/api/settings")
+async def api_settings_save(request: Request):
+    b = await _body(request)
+    if "schedule" in b:
+        sc = b["schedule"]
+        times = sorted({str(t).strip() for t in sc.get("check_times", [])})
+        for t in times:
+            if not TIME_RE.match(t):
+                bad(f"Invalid time {t!r}; use HH:MM")
+        days = sorted({int(d) for d in sc.get("days", [])})
+        if any(d < 0 or d > 6 for d in days):
+            bad("Invalid day")
+        RAW.setdefault("schedule", {})
+        RAW["schedule"]["check_times"] = times
+        RAW["schedule"]["days"] = days
+    if "discord" in b:
+        d = b["discord"]
+        RAW.setdefault("discord", {})
+        if d.get("clear_webhook"):
+            RAW["discord"]["webhook"] = ""
+        elif d.get("webhook"):
+            hook = str(d["webhook"]).strip()
+            if not hook.startswith(("https://", "http://")):
+                bad("The webhook should be a URL starting with https://")
+            RAW["discord"]["webhook"] = hook
+        if "on_check" in d:
+            if d["on_check"] not in ("always", "new", "off"):
+                bad("Invalid notification mode")
+            RAW["discord"]["on_check"] = d["on_check"]
+        if "on_update" in d:
+            RAW["discord"]["on_update"] = bool(d["on_update"])
+    if "snapshots" in b:
+        sn = b["snapshots"]
+        keep = int(sn.get("keep", SNAP["keep"]))
+        if not 1 <= keep <= 50:
+            bad("Keep must be between 1 and 50")
+        if sn.get("on_failure", "abort") not in ("abort", "continue"):
+            bad("Invalid snapshot failure option")
+        RAW["snapshots"] = {"enabled": bool(sn.get("enabled", True)), "keep": keep,
+                            "on_failure": sn.get("on_failure", "abort")}
+    if "base_url" in b:
+        RAW["base_url"] = str(b["base_url"]).strip()
+    if "exclude" in b:
+        try:
+            RAW["exclude"] = sorted({int(v) for v in b["exclude"]})
+        except (TypeError, ValueError):
+            bad("Excluded IDs must be numbers")
+    try:
+        save_config()
+    except (ValueError, SystemExit) as e:
+        bad(str(e))
+    return settings_payload()
+
+
+@app.post("/api/settings/discord-test")
+async def api_discord_test():
+    if not DISCORD.get("webhook"):
+        bad("No webhook configured")
+    try:
+        await discord(DISCORD["webhook"], "👋 Test message from Patchdeck. Notifications are working.", raise_errors=True)
+    except Exception as e:
+        bad(f"Discord rejected the message: {e}")
+    return {"ok": True}
+
+
+@app.post("/api/hosts")
+async def api_host_save(request: Request):
+    b = await _body(request)
+    name, address = str(b.get("name", "")).strip(), str(b.get("address", "")).strip()
+    try:
+        port = int(b.get("port") or 22)
+    except (TypeError, ValueError):
+        bad("Port must be a number")
+    if not NAME_RE.match(name):
+        bad("Name: letters, numbers, dot, dash or underscore (max 40)")
+    if not ADDR_RE.match(address):
+        bad("Enter an IP address or hostname")
+    if not 1 <= port <= 65535:
+        bad("Port must be 1-65535")
+    hosts = RAW.setdefault("hosts", []) or []
+    RAW["hosts"] = hosts
+    original = b.get("original")
+    if original:
+        entry = next((h for h in hosts if h.get("name") == original), None)
+        if entry is None:
+            raise HTTPException(404, "Unknown host")
+        if host_busy(original):
+            raise HTTPException(409, "This host has a check or update running")
+        if name != original and any(h.get("name") == name for h in hosts):
+            raise HTTPException(409, "A host with that name already exists")
+        entry.update(name=name, address=address)
+        if port == 22:
+            entry.pop("port", None)
+        else:
+            entry["port"] = port
+        if name != original:
+            STATE["hosts"].pop(original, None)
+            save_state()
+    else:
+        if any(h.get("name") == name for h in hosts):
+            raise HTTPException(409, "A host with that name already exists")
+        hosts.append({"name": name, "address": address, **({"port": port} if port != 22 else {})})
+    save_config()
+    return settings_payload()
+
+
+@app.post("/api/hosts/delete")
+async def api_host_delete(request: Request):
+    b = await _body(request)
+    h = get_host(b)
+    if host_busy(h.name):
+        raise HTTPException(409, "This host has a check or update running")
+    RAW["hosts"] = [x for x in RAW.get("hosts") or [] if x.get("name") != h.name]
+    STATE["hosts"].pop(h.name, None)
+    save_state()
+    save_config()
+    return settings_payload()
+
+
+@app.post("/api/hosts/fingerprint")
+async def api_host_fingerprint(request: Request):
+    h = get_host(await _body(request))
+    try:
+        info = sshsetup.describe(await sshsetup.fetch_host_key(h.address, h.port))
+    except Exception as e:
+        bad(sshsetup.explain(e))
+    kind = KEY_FILES.get(info["type"], "ecdsa" if info["type"].startswith("ecdsa") else "ed25519")
+    info["verify_cmd"] = f"ssh-keygen -lf /etc/ssh/ssh_host_{kind}_key.pub"
+    return info
+
+
+@app.post("/api/hosts/trust")
+async def api_host_trust(request: Request):
+    b = await _body(request)
+    h = get_host(b)
+    if not KNOWN_HOSTS:
+        bad("Host key checking is disabled in config.yaml")
+    try:
+        await sshsetup.trust(KNOWN_HOSTS, h.address, h.port, str(b.get("fingerprint", "")))
+    except Exception as e:
+        bad(sshsetup.explain(e))
+    return settings_payload()
+
+
+@app.post("/api/hosts/install-key")
+async def api_host_install_key(request: Request):
+    b = await _body(request)
+    h = get_host(b)
+    pub = sshsetup.public_key(KEY_FILE)
+    if not pub:
+        bad("Generate Patchdeck's SSH key first")
+    if not b.get("password"):
+        bad("Enter the host's root password")
+    try:
+        await sshsetup.install_key(h.address, h.port, h.user, str(b["password"]), KNOWN_HOSTS, pub)
+    except Exception as e:
+        bad(sshsetup.explain(e))
+    return {"ok": True}
+
+
+@app.post("/api/hosts/test")
+async def api_host_test(request: Request):
+    h = get_host(await _body(request))
+    try:
+        return await sshsetup.test(h.address, h.port, h.user, h.key_file, KNOWN_HOSTS)
+    except Exception as e:
+        bad(sshsetup.explain(e))
+
+
+@app.post("/api/key/generate")
+async def api_key_generate():
+    try:
+        sshsetup.generate_key(KEY_FILE)
+    except Exception as e:
+        bad(str(e))
+    return settings_payload()

@@ -16,7 +16,11 @@
         <p id="summary" class="muted">Loading…</p>
       </div>
     </div>
-    <div class="actions">
+    <nav class="tabs" aria-label="Views">
+      <a href="#" data-view="dash" class="tab active">Dashboard</a>
+      <a href="#settings" data-view="settings" class="tab">Settings</a>
+    </nav>
+    <div class="actions" id="dash-actions">
       <label class="toggle" title="Take a Proxmox snapshot of each container before updating it">
         <input type="checkbox" id="snapshot"> <span>Snapshot first</span>
       </label>
@@ -25,7 +29,7 @@
     </div>
   </header>
 
-  <main>
+  <main id="view-dash">
     <div id="hosts"></div>
 
     <section class="panel activity">
@@ -33,6 +37,8 @@
       <ul id="jobs" class="jobs"></ul>
     </section>
   </main>
+
+  <main id="view-settings" hidden></main>
 
   <aside id="log" class="log" hidden>
     <div class="log-head">
@@ -47,5 +53,6 @@
 
   <div id="toast" class="toast" hidden></div>
   <script src="/static/app.js"></script>
+  <script src="/static/settings.js"></script>
 </body>
 </html>

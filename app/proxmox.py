@@ -1,6 +1,7 @@
 """Talks to a Proxmox VE host over SSH and runs commands on it and inside its LXCs."""
 import asyncio
 import json
+import os
 import re
 import secrets
 import shlex
@@ -81,6 +82,8 @@ class Host:
         self.host_console_url = host_console_url
 
     def _connect(self):
+        if self.known_hosts and not os.path.exists(self.known_hosts):
+            raise RuntimeError("Host fingerprint not trusted yet; set it up in Settings")
         return asyncssh.connect(
             self.address, port=self.port, username=self.user,
             client_keys=[self.key_file] if self.key_file else None,
