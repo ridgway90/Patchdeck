@@ -1,0 +1,41 @@
+# Copy to data/config.yaml and edit.
+
+# Used for the link in Discord messages (your Tailscale name works well).
+base_url: http://patchdeck.your-tailnet.ts.net:8080
+
+auth:
+  username: admin
+  password: change-me            # or set PATCHDECK_PASSWORD
+
+ssh:
+  user: root
+  key_file: /data/id_ed25519      # private key authorised on each PVE host
+  known_hosts: /data/known_hosts  # fill with: ssh-keyscan <host> >> data/known_hosts
+
+hosts:
+  - name: pve1
+    address: 192.168.1.10
+  - name: pve2
+    address: 192.168.1.11
+
+# Optional: where the Console / Shell buttons go. Default is the Proxmox web console.
+# Placeholders: {vmid} {node} {name} {address} {host}
+# console_url: "https://{address}:8006/?console=lxc&xtermjs=1&vmid={vmid}&node={node}"
+# host_console_url: "https://{address}:8006/?console=shell&xtermjs=1&node={node}"
+# You can also set console_url per host under hosts:.
+
+schedule:
+  check_times: ["08:00"]          # local time (TZ); add more e.g. ["08:00", "18:00"]
+
+discord:
+  webhook: ""                     # or set DISCORD_WEBHOOK
+  on_check: always                # always | new (only when new updates appear) | off
+  on_update: true                 # message when updates finish
+
+snapshots:
+  enabled: true                   # default for the "Snapshot first" toggle
+  keep: 3                         # pre-update snapshots kept per container
+  on_failure: abort               # abort | continue (e.g. storage without snapshot support)
+
+# Container IDs to hide entirely
+exclude: []

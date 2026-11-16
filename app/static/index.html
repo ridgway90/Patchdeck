@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Patchdeck</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%23e5702a'/><path d='M9 17l5 5 9-11' stroke='white' stroke-width='3.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <span class="logo" aria-hidden="true"></span>
+      <div>
+        <h1>Patchdeck</h1>
+        <p id="summary" class="muted">Loading…</p>
+      </div>
+    </div>
+    <div class="actions">
+      <label class="toggle" title="Take a Proxmox snapshot of each container before updating it">
+        <input type="checkbox" id="snapshot"> <span>Snapshot first</span>
+      </label>
+      <button id="check-all" class="btn">Check now</button>
+      <button id="update-all" class="btn primary">Update all containers</button>
+    </div>
+  </header>
+
+  <main>
+    <div id="hosts"></div>
+
+    <section class="panel activity">
+      <h2>Recent activity</h2>
+      <ul id="jobs" class="jobs"></ul>
+    </section>
+  </main>
+
+  <aside id="log" class="log" hidden>
+    <div class="log-head">
+      <div>
+        <strong id="log-title"></strong>
+        <span id="log-status" class="pill"></span>
+      </div>
+      <button id="log-close" class="btn ghost" aria-label="Close log">✕</button>
+    </div>
+    <pre id="log-body"></pre>
+  </aside>
+
+  <div id="toast" class="toast" hidden></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
