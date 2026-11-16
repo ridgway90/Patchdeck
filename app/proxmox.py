@@ -189,10 +189,15 @@ class Host:
         """Run cmd detached on the host (so a dropped SSH session can't kill apt halfway),
         and stream its output. Returns the command's exit code."""
         log = f"/tmp/patchdeck-{secrets.token_hex(6)}.log"
-        inner = f"{cmd}; echo {RC_MARK}$?"
+        inner = f"( {cmd} ); echo {RC_MARK}$?"  # subshell: the marker is written even if cmd exits
+        # Create the log before starting the job: the background shell opens it asynchronously,
+        # and tail would otherwise race it and exit with "No such file". Keep the log if the
+        # job never reported an exit code, so it can be inspected on the host.
         wrapped = (
-            f"setsid nohup sh -c {shlex.quote(inner)} > {log} 2>&1 < /dev/null & PID=$!; "
-            f"tail -n +1 -f --pid=$PID {log}; rm -f {log}"
+            f": > {log}; "
+            f"setsid nohup sh -c {shlex.quote(inner)} >> {log} 2>&1 < /dev/null & PID=$!; "
+            f"tail -n +1 -F --pid=$PID {log} 2>/dev/null; "
+            f"grep -q {RC_MARK} {log} && rm -f {log}"
         )
         rc = None
         async with self._connect() as conn:
@@ -206,7 +211,8 @@ class Host:
                     on_line(line)
                 await proc.wait()
         if rc is None:
-            raise RuntimeError("Lost connection before the update finished; check the host")
+            raise RuntimeError(f"Lost track of the update before it finished. It may still be running on "
+                               f"the host; its output is in {log}. Run a check again in a few minutes.")
         return rc
 
     def upgrade_cmd(self, vmid=None, fam="apt"):
