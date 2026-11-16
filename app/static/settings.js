@@ -330,6 +330,7 @@ function generalSection() {
       <label class="field"><span>Dashboard address (linked in Discord messages)</span>
         <input name="base_url" value="${esc(S.base_url)}" placeholder="http://patchdeck.your-tailnet.ts.net:8080">
       </label>
+      <label class="check"><input type="checkbox" name="win_drivers" ${S.windows_updates.drivers ? "checked" : ""}> <span>Include driver updates for Windows VMs</span></label>
       <label class="field"><span>Hidden container IDs (comma separated)</span>
         <input name="exclude" value="${esc(S.exclude.join(", "))}" placeholder="e.g. 104, 120">
       </label>
@@ -564,7 +565,8 @@ $("#view-settings").addEventListener("submit", async (e) => {
     case "general": {
       const exclude = v("exclude").split(/[\s,]+/).filter(Boolean);
       if (exclude.some((x) => !/^\d+$/.test(x))) return toast("Container IDs must be numbers");
-      const r = await act(btn, "/api/settings", { base_url: v("base_url"), exclude: exclude.map(Number) }, "Saving…");
+      const r = await act(btn, "/api/settings", { base_url: v("base_url"), exclude: exclude.map(Number),
+        windows_updates: { drivers: f.elements.win_drivers.checked } }, "Saving…");
       if (r) { toast("Saved"); applySettings(r, ["general"]); refresh(); }
       break;
     }

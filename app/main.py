@@ -105,6 +105,8 @@ def effective(raw):
         logins = [lg for lg in logins if lg["registry"] != "registry-1.docker.io"]
         logins.append({"registry": "registry-1.docker.io", "username": os.environ["DOCKERHUB_USERNAME"],
                        "token": os.environ["DOCKERHUB_TOKEN"], "env": True})
+    wn = cfg.get("windows_updates") if isinstance(cfg.get("windows_updates"), dict) else {}
+    cfg["windows_updates"] = {"drivers": bool(wn.get("drivers", False))}
     cfg["docker"] = {"enabled": bool(dk.get("enabled", True)), "prune": bool(dk.get("prune", True)),
                      "logins": logins}
     cfg["maintenance"], cfg["schedules"] = normalise_maintenance(cfg)
@@ -149,8 +151,9 @@ def apply_config():
         )
         for h in CFG["hosts"]
     }
-    for name in HOSTS:
+    for name, h in HOSTS.items():
         HOST_LOCKS.setdefault(name, asyncio.Lock())
+        h.win_drivers = CFG["windows_updates"]["drivers"]
     SNAP = {"enabled": bool(CFG["snapshots"].get("enabled", True)),
             "keep": int(CFG["snapshots"].get("keep", 3)),
             "on_failure": CFG["snapshots"].get("on_failure", "abort")}
@@ -507,8 +510,11 @@ async def run_update(job):
                 before = len(ct["packages"])
                 if job.snapshot:
                     await take_snapshot(job, h, kind)
-                job.log(f"$ {'apt-get dist-upgrade' if fam == 'apt' else 'apk upgrade'} in {ct['name']}")
-                if kind == "vm":
+                job.log(f"$ {({'apt': 'apt-get dist-upgrade', 'apk': 'apk upgrade', 'win': 'Windows Update'})[fam]} in {ct['name']}")
+                if fam == "win":
+                    job.log("(Windows output arrives through the guest agent every few seconds; searching alone can take minutes)")
+                    rc = await h.run_windows(job.vmid, job.log)
+                elif kind == "vm":
                     job.log("(VM output arrives through the guest agent every few seconds)")
                     rc = await h.run_vm(job.vmid, APT_UPGRADE if fam == "apt" else APK_UPGRADE, job.log)
                 else:
@@ -526,7 +532,8 @@ async def run_update(job):
                     spawn(delayed_check(job.host, 420))
                 else:
                     job.log(f"Reboot required: rebooting {job.name}…")
-                    await h.reboot_guest(job.vmid, kind, job.log)
+                    is_win = (find_ct(job.host, job.vmid) or {}).get("os") == "mswindows"
+                    await h.reboot_guest(job.vmid, kind, job.log, wait=1200 if is_win else 300)
                     after = await recheck(job)
                     notes.append("rebooted")
             elif after.get("reboot"):
@@ -1129,6 +1136,7 @@ def settings_payload():
                     "on_check": DISCORD.get("on_check", "always"),
                     "on_update": bool(DISCORD.get("on_update", True))},
         "snapshots": SNAP,
+        "windows_updates": CFG["windows_updates"],
         "docker": {"enabled": DOCKER["enabled"], "prune": DOCKER["prune"],
                    "logins": [{"registry": lg["registry"], "username": lg["username"],
                                "token_set": bool(lg["token"]), "from_env": bool(lg.get("env"))}
@@ -1222,6 +1230,8 @@ async def api_settings_save(request: Request):
                                     "reboot": bool(pol.get("reboot"))}
         RAW["schedules"] = scheds
         RAW.pop("maintenance_only", None)
+    if "windows_updates" in b:
+        RAW["windows_updates"] = {"drivers": bool(b["windows_updates"].get("drivers"))}
     if "docker" in b:
         d = b["docker"]
         raw = RAW.get("docker") if isinstance(RAW.get("docker"), dict) else {}

@@ -59,7 +59,12 @@ function jobPill(job) {
   return `<button class="pill info running" data-log="${esc(job.id)}">${label}</button>`;
 }
 
+const fmtSize = (b) => (b >= 1e9 ? `${(b / 1e9).toFixed(1)} GB` : b >= 1e6 ? `${Math.round(b / 1e6)} MB` : b > 0 ? `${Math.max(1, Math.round(b / 1e3))} KB` : "");
+
 function pkgList(pkgs) {
+  if (pkgs.length && pkgs[0].kb !== undefined) {  // Windows updates
+    return `<div class="pkgs win">${pkgs.map((p) => `<span>${esc(p.kb || "—")}</span><span>${esc(p.name)}${p.size ? ` <em>· ${fmtSize(p.size)}</em>` : ""}</span>`).join("")}</div>`;
+  }
   return `<div class="pkgs">${pkgs.map((p) => `<span>${esc(p.name)}</span><span>${esc(p.from)} → ${esc(p.to)}</span>`).join("")}</div>`;
 }
 
@@ -148,7 +153,7 @@ function renderRow(host, c) {
   return `
     <div class="row${running ? "" : " dim"}">
       <div class="ct-name"><strong>${esc(c.name)}</strong><span class="vmid">${c.vmid}</span>${c.type === "vm" ? `<span class="kind-tag">VM</span>` : ""}</div>
-      <div class="os">${esc(({ mswindows: "Windows" })[c.os] || c.os || "")}</div>
+      <div class="os" title="${esc(c.os_name || "")}">${esc(({ mswindows: "Windows" })[c.os] || c.os || "")}</div>
       <div class="state">${stateHtml}</div>
       <div class="row-actions">
         ${running ? targetActions(host.name, c.vmid, c, n, "Update…") : ""}

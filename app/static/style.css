@@ -354,3 +354,6 @@ form.inline input { flex: 1 1 200px; max-width: 320px; }
   .pkgs.imgs span:nth-child(even) { margin-bottom: 6px; }
 }
 .login-result { font-size: 13px; }
+.pkgs.win { font-family: inherit; font-size: 12.5px; }
+.pkgs.win span:nth-child(odd) { font-family: var(--mono); font-size: 12px; white-space: nowrap; }
+.pkgs.win em { color: var(--muted); font-style: normal; }
