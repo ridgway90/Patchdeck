@@ -236,6 +236,50 @@ function schedulesSection() {
     <div class="form-actions"><button type="button" class="btn small primary" data-act="sched-save">Save schedules</button></div>`;
 }
 
+let loginDraft = null;  // unsaved registry login edits (tokens only kept until saved)
+const hubName = (r) => (r === "registry-1.docker.io" ? "docker.io" : r);
+
+function dockerSection() {
+  const d = S.docker;
+  if (!loginDraft) loginDraft = d.logins.map((lg) => ({ ...lg, registry: hubName(lg.registry), token: "" }));
+  const rows = loginDraft.map((lg, i) => `
+    <div class="win-card login" data-login="${i}">
+      <div class="fields">
+        <label class="field"><span>Registry</span><input data-lf="registry" value="${esc(lg.registry)}" placeholder="docker.io" ${lg.from_env ? "disabled" : ""}></label>
+        <label class="field"><span>Username</span><input data-lf="username" value="${esc(lg.username)}" autocomplete="off" ${lg.from_env ? "disabled" : ""}></label>
+        <label class="field grow"><span>Password or access token</span><input data-lf="token" type="password" autocomplete="new-password" value="${esc(lg.token || "")}"
+          placeholder="${lg.token_set ? "Saved. Leave blank to keep it" : "Personal access token"}" ${lg.from_env ? "disabled" : ""}></label>
+      </div>
+      ${lg.from_env ? `<p class="hint">Set by the DOCKERHUB_USERNAME / DOCKERHUB_TOKEN environment variables.</p>` : ""}
+      <div class="form-actions">
+        <button type="button" class="btn small" data-act="login-test" data-i="${i}">Test login</button>
+        ${lg.from_env ? "" : `<button type="button" class="btn small ghost danger" data-act="login-del" data-i="${i}">Remove</button>`}
+        <span class="login-result" data-result="${i}"></span>
+      </div>
+    </div>`).join("");
+  return `
+    <form data-form="docker">
+      <label class="check"><input type="checkbox" name="enabled" ${d.enabled ? "checked" : ""}> <span>Check Docker Compose stacks for new image versions</span></label>
+      <label class="check"><input type="checkbox" name="prune" ${d.prune ? "checked" : ""}> <span>Remove unused old images after updating a stack (<code>docker image prune</code>)</span></label>
+      <h3>Registry logins</h3>
+      <p class="hint">Without a login Docker Hub allows about 100 image lookups an hour per IP address; logging in raises that and lets Patchdeck check private images.
+        For Docker Hub, use your username and a <strong>read-only personal access token</strong> (Docker Hub → Account settings → Personal access tokens), not your password.
+        Other registries (ghcr.io, a private registry…) work the same way. Tokens are stored in config.yaml and never shown again.</p>
+      <div class="windows">${rows || `<p class="muted">No logins. Public images are checked anonymously.</p>`}</div>
+      <div class="form-actions">
+        <button type="button" class="btn small" data-act="login-add">+ Add login</button>
+        <button class="btn primary small">Save</button>
+      </div>
+    </form>`;
+}
+
+function collectLogins() {
+  document.querySelectorAll("#s-docker [data-login]").forEach((card) => {
+    const lg = loginDraft[Number(card.dataset.login)];
+    card.querySelectorAll("[data-lf]").forEach((inp) => { if (!inp.disabled) lg[inp.dataset.lf] = inp.value.trim(); });
+  });
+}
+
 function discordSection() {
   const d = S.discord;
   return `
@@ -286,8 +330,6 @@ function generalSection() {
       <label class="field"><span>Dashboard address (linked in Discord messages)</span>
         <input name="base_url" value="${esc(S.base_url)}" placeholder="http://patchdeck.your-tailnet.ts.net:8080">
       </label>
-      <label class="check"><input type="checkbox" name="docker_enabled" ${S.docker.enabled ? "checked" : ""}> Check Docker Compose stacks for new image versions</label>
-      <label class="check"><input type="checkbox" name="docker_prune" ${S.docker.prune ? "checked" : ""}> Remove unused old images after updating a stack (<code>docker image prune</code>)</label>
       <label class="field"><span>Hidden container IDs (comma separated)</span>
         <input name="exclude" value="${esc(S.exclude.join(", "))}" placeholder="e.g. 104, 120">
       </label>
@@ -301,6 +343,7 @@ const SECTIONS = [
   ["schedule", "Check schedule", scheduleSection],
   ["windows", "Maintenance windows", windowsSection],
   ["schedules", "Maintenance schedules", schedulesSection],
+  ["docker", "Docker", dockerSection],
   ["discord", "Discord notifications", discordSection],
   ["snapshots", "Snapshots", snapshotSection],
   ["general", "General", generalSection],
@@ -323,6 +366,7 @@ async function loadSettings() {
   try {
     S = await api("/api/settings");
     winDraft = null;
+    loginDraft = null;
     schedDraft = { check_times: [...S.schedule.check_times], days: [...S.schedule.days] };
     renderSettings();
   } catch (e) { toast(e.message); }
@@ -390,6 +434,25 @@ $("#view-settings").addEventListener("click", async (e) => {
       applySettings(await act(b, "/api/hosts/delete", { name: host }, "Removing…"), ["hosts", "schedule", "schedules"]);
       refresh();
       break;
+    case "login-add":
+      collectLogins();
+      loginDraft.push({ registry: loginDraft.some((l) => hubName(l.registry) === "docker.io") ? "" : "docker.io", username: "", token: "" });
+      renderSettings(["docker"]);
+      break;
+    case "login-del":
+      collectLogins();
+      loginDraft.splice(Number(b.dataset.i), 1);
+      renderSettings(["docker"]);
+      break;
+    case "login-test": {
+      collectLogins();
+      const lg = loginDraft[Number(b.dataset.i)];
+      const out = document.querySelector(`#s-docker [data-result="${b.dataset.i}"]`);
+      out.textContent = "";
+      const r = await act(b, "/api/settings/registry-test", { registry: lg.registry, username: lg.username, token: lg.token }, "Testing…");
+      if (r) { out.textContent = (r.ok ? "✓ " : "✗ ") + r.message; out.className = `login-result ${r.ok ? "ok-text" : "bad-text"}`; }
+      break;
+    }
     case "win-add":
       collectWindows();
       winDraft.push({ name: "", days: [5, 6], start: "02:00", end: "05:00" });
@@ -478,6 +541,14 @@ $("#view-settings").addEventListener("submit", async (e) => {
       }
       break;
     }
+    case "docker": {
+      collectLogins();
+      const logins = loginDraft.filter((l) => !l.from_env && (l.username || l.token))
+        .map((l) => ({ registry: l.registry || "docker.io", username: l.username, token: l.token }));
+      const r = await act(btn, "/api/settings", { docker: { enabled: f.elements.enabled.checked, prune: f.elements.prune.checked, logins } }, "Saving…");
+      if (r) { loginDraft = null; toast("Docker settings saved"); applySettings(r, ["docker"]); refresh(); }
+      break;
+    }
     case "discord": {
       const body = { on_check: v("on_check"), on_update: f.elements.on_update.checked };
       if (v("webhook")) body.webhook = v("webhook").trim();
@@ -493,8 +564,7 @@ $("#view-settings").addEventListener("submit", async (e) => {
     case "general": {
       const exclude = v("exclude").split(/[\s,]+/).filter(Boolean);
       if (exclude.some((x) => !/^\d+$/.test(x))) return toast("Container IDs must be numbers");
-      const r = await act(btn, "/api/settings", { base_url: v("base_url"), exclude: exclude.map(Number),
-        docker: { enabled: f.elements.docker_enabled.checked, prune: f.elements.docker_prune.checked } }, "Saving…");
+      const r = await act(btn, "/api/settings", { base_url: v("base_url"), exclude: exclude.map(Number) }, "Saving…");
       if (r) { toast("Saved"); applySettings(r, ["general"]); refresh(); }
       break;
     }

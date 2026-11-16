@@ -64,6 +64,10 @@ snapshots:
 docker:
   enabled: true                   # check Compose stacks for new image versions
   prune: true                     # docker image prune -f after updating a stack
+  logins:                         # optional; easier to add under Settings → Docker
+    - registry: docker.io
+      username: your-docker-id
+      token: dckr_pat_xxxxxxxx    # read-only personal access token
 
 # Container IDs to hide entirely
 exclude: []
