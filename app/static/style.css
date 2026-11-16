@@ -339,3 +339,17 @@ form.inline input { flex: 1 1 200px; max-width: 320px; }
 .sched-table td.c { text-align: center; }
 .sched-table input[type=checkbox] { accent-color: var(--accent); width: 16px; height: 16px; }
 .table-wrap { overflow-x: auto; }
+
+/* ---------- docker stacks ---------- */
+.stack-row { padding-left: 76px; background: color-mix(in srgb, var(--surface-2) 55%, transparent); }
+.stack-row .ct-name strong { font-weight: 550; }
+.whale { font-size: 13px; }
+.pkgs.imgs span:nth-child(even) { color: var(--muted); }
+.warn-text { color: var(--warn); }
+@media (max-width: 720px) { .stack-row { padding-left: 28px; } }
+.sched-table .indent { padding-left: 18px; display: inline-block; }
+.stack-row .os { text-transform: none; }
+@media (max-width: 720px) {
+  .pkgs.imgs { grid-template-columns: 1fr; }
+  .pkgs.imgs span:nth-child(even) { margin-bottom: 6px; }
+}

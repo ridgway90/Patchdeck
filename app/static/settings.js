@@ -211,21 +211,23 @@ function schedulesSection() {
   if (!S.windows.length) return `<p class="muted">Add and save a maintenance window first.</p>`;
   const opts = (cur) => `<option value="">No schedule</option>` + S.windows.map((w) =>
     `<option value="${esc(w.name)}" ${cur === w.name ? "selected" : ""}>${esc(w.name)}</option>`).join("");
-  const row = (key, label) => {
+  const row = (key, label, isStack) => {
     const p = S.schedules[key] || {};
     return `<tr data-key="${esc(key)}">
       <td>${label}</td>
       <td><select data-sf="window" aria-label="Window for ${esc(key)}">${opts(p.window)}</select></td>
       <td class="c"><input type="checkbox" data-sf="auto" ${p.auto ? "checked" : ""} aria-label="Auto-update"></td>
-      <td class="c"><input type="checkbox" data-sf="reboot" ${p.reboot ? "checked" : ""} aria-label="Reboot if needed"></td>
+      <td class="c">${isStack ? "" : `<input type="checkbox" data-sf="reboot" ${p.reboot ? "checked" : ""} aria-label="Reboot if needed">`}</td>
     </tr>`;
   };
   const body = S.targets.map((t) => `
     <tr class="grp"><td colspan="4">${esc(t.host)}</td></tr>
     ${row(`${t.host}/host`, t.kind === "pve" ? "<em>The Proxmox host itself</em>" : "<em>This server</em>")}
-    ${t.containers.map((c) => row(`${t.host}/${c.vmid}`, `${esc(c.name)} <span class="vmid">${c.vmid}</span>${c.type === "vm" ? ' <span class="kind-tag">VM</span>' : ""}`)).join("")}`).join("");
+    ${(t.stacks || []).map((st) => row(`${t.host}/host:${st}`, `<span class="indent">🐳 ${esc(st)}</span>`, true)).join("")}
+    ${t.containers.map((c) => row(`${t.host}/${c.vmid}`, `${esc(c.name)} <span class="vmid">${c.vmid}</span>${c.type === "vm" ? ' <span class="kind-tag">VM</span>' : ""}`)
+      + (c.stacks || []).map((st) => row(`${t.host}/${c.vmid}:${st}`, `<span class="indent">🐳 ${esc(st)}</span>`, true)).join("")).join("")}`).join("");
   return `
-    <p>Give a container, VM or host a window. Its Update dialog then defaults to that window, and Update all queues it there.
+    <p>Give a container, VM, host or Docker stack (🐳) a window. Its Update dialog then defaults to that window, and Update all queues it there.
       Tick <strong>Auto</strong> to have it checked and updated in its window without you clicking anything.</p>
     <div class="table-wrap"><table class="sched-table">
       <thead><tr><th>Target</th><th>Window</th><th class="c">Auto</th><th class="c">Reboot if needed</th></tr></thead>
@@ -284,6 +286,8 @@ function generalSection() {
       <label class="field"><span>Dashboard address (linked in Discord messages)</span>
         <input name="base_url" value="${esc(S.base_url)}" placeholder="http://patchdeck.your-tailnet.ts.net:8080">
       </label>
+      <label class="check"><input type="checkbox" name="docker_enabled" ${S.docker.enabled ? "checked" : ""}> Check Docker Compose stacks for new image versions</label>
+      <label class="check"><input type="checkbox" name="docker_prune" ${S.docker.prune ? "checked" : ""}> Remove unused old images after updating a stack (<code>docker image prune</code>)</label>
       <label class="field"><span>Hidden container IDs (comma separated)</span>
         <input name="exclude" value="${esc(S.exclude.join(", "))}" placeholder="e.g. 104, 120">
       </label>
@@ -411,7 +415,8 @@ $("#view-settings").addEventListener("click", async (e) => {
       const schedules = {};
       document.querySelectorAll("#s-schedules tr[data-key]").forEach((tr) => {
         const win = tr.querySelector('[data-sf="window"]').value;
-        if (win) schedules[tr.dataset.key] = { window: win, auto: tr.querySelector('[data-sf="auto"]').checked, reboot: tr.querySelector('[data-sf="reboot"]').checked };
+        const rb = tr.querySelector('[data-sf="reboot"]');
+        if (win) schedules[tr.dataset.key] = { window: win, auto: tr.querySelector('[data-sf="auto"]').checked, reboot: !!(rb && rb.checked) };
       });
       const r = await act(b, "/api/settings", { schedules }, "Saving…");
       if (r) { toast("Schedules saved"); applySettings(r, ["schedules"]); refresh(); }
@@ -488,7 +493,8 @@ $("#view-settings").addEventListener("submit", async (e) => {
     case "general": {
       const exclude = v("exclude").split(/[\s,]+/).filter(Boolean);
       if (exclude.some((x) => !/^\d+$/.test(x))) return toast("Container IDs must be numbers");
-      const r = await act(btn, "/api/settings", { base_url: v("base_url"), exclude: exclude.map(Number) }, "Saving…");
+      const r = await act(btn, "/api/settings", { base_url: v("base_url"), exclude: exclude.map(Number),
+        docker: { enabled: f.elements.docker_enabled.checked, prune: f.elements.docker_prune.checked } }, "Saving…");
       if (r) { toast("Saved"); applySettings(r, ["general"]); refresh(); }
       break;
     }
