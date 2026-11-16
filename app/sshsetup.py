@@ -127,8 +127,13 @@ async def test(address, port, user, key_file, known_hosts):
     async with asyncssh.connect(address, port=int(port), username=user, client_keys=[key_file],
                                 known_hosts=known_hosts, preferred_auth=["publickey"],
                                 connect_timeout=15) as conn:
-        r = await conn.run("hostname; pveversion 2>/dev/null || echo 'pveversion not found'; "
-                           "pct list 2>/dev/null | tail -n +2 | wc -l", check=False, timeout=30)
+        r = await conn.run(
+            "hostname; "
+            "if command -v pveversion >/dev/null; then pveversion; "
+            "elif command -v proxmox-backup-manager >/dev/null; then proxmox-backup-manager versions | head -n 1; "
+            "else . /etc/os-release; echo \"$PRETTY_NAME\"; fi; "
+            "if command -v pct >/dev/null; then pct list | tail -n +2 | wc -l; else echo -; fi",
+            check=False, timeout=30)
         out = (r.stdout or "").strip().splitlines()
         return {"node": out[0] if out else "?", "version": out[1] if len(out) > 1 else "?",
                 "containers": int(out[2]) if len(out) > 2 and out[2].isdigit() else None}

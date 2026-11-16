@@ -63,6 +63,33 @@ function pkgList(pkgs) {
   return `<div class="pkgs">${pkgs.map((p) => `<span>${esc(p.name)}</span><span>${esc(p.from)} → ${esc(p.to)}</span>`).join("")}</div>`;
 }
 
+function windowLabel() {
+  const m = state && state.maintenance;
+  if (!m || !m.next_start) return null;
+  const d = new Date(m.next_start * 1000);
+  if (m.next_start * 1000 <= Date.now()) return "now";
+  return d.toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" });
+}
+
+/* Update / schedule buttons for one target (a container, or a host when vmid is null). */
+function targetActions(hostName, vmid, t, n, updateLabel) {
+  if (t.job) return "";
+  const v = vmid == null ? "" : ` data-vmid="${vmid}"`;
+  const h = esc(hostName);
+  if (t.scheduled) {
+    return `<button class="btn small sched" data-unschedule="${h}"${v} title="Scheduled for the maintenance window. Click to cancel.">🌙 ${esc(windowLabel() || "Scheduled")} <span aria-hidden="true">✕</span></button>`;
+  }
+  if (!n) return "";
+  const win = windowLabel();
+  const moonTitle = win ? `Schedule for the maintenance window (${win})` : "Set up a maintenance window in Settings to schedule updates";
+  if (t.maint_only) {
+    return `<button class="btn small primary" data-schedule="${h}"${v} title="${esc(moonTitle)}">🌙 Schedule</button>
+            <button class="btn small ghost" data-update="${h}"${v} title="Update now instead of waiting for the window">Now</button>`;
+  }
+  return `<button class="btn small ${vmid == null ? "" : "primary"}" data-update="${h}"${v}>${updateLabel}</button>
+          <button class="btn small icon" data-schedule="${h}"${v} title="${esc(moonTitle)}" aria-label="${esc(moonTitle)}">🌙</button>`;
+}
+
 function renderRow(host, c) {
   const key = `${host.name}/${c.vmid}`;
   const n = c.packages.length;
@@ -81,7 +108,7 @@ function renderRow(host, c) {
       <div class="os">${esc(c.os || "")}</div>
       <div class="state">${stateHtml}</div>
       <div class="row-actions">
-        ${running && n && !c.job ? `<button class="btn small primary" data-update="${esc(host.name)}" data-vmid="${c.vmid}">Update</button>` : ""}
+        ${running ? targetActions(host.name, c.vmid, c, n, "Update") : ""}
         ${c.console ? `<a class="btn small" href="${esc(c.console)}" target="_blank" rel="noopener">Console</a>` : ""}
       </div>
       ${openPkgs.has(key) && n ? pkgList(c.packages) : ""}
@@ -100,22 +127,25 @@ function renderHost(h) {
   if (h.error) meta += `<span class="pill bad" title="${esc(h.error)}">Unreachable</span><span class="err" title="${esc(h.error)}">${esc(h.error)}</span>`;
 
   const cts = h.containers || [];
-  const rows = cts.length ? cts.map((c) => renderRow(h, c)).join("") : `<div class="empty">${h.checked_at ? "No containers found." : "Not checked yet."}</div>`;
+  const isPve = h.kind === "pve";
+  const rows = cts.length ? cts.map((c) => renderRow(h, c)).join("")
+    : isPve ? `<div class="empty">${h.checked_at ? "No containers found." : "Not checked yet."}</div>` : "";
+  const kindLabel = { pbs: "Backup Server", debian: "Server" }[h.kind];
 
   return `
     <section class="panel${collapsed.has(h.name) ? " collapsed" : ""}" data-host="${esc(h.name)}">
       <div class="host-head">
         <button class="chev" data-collapse="${esc(h.name)}" aria-label="Toggle ${esc(h.name)}">▼</button>
-        <div class="host-title"><strong>${esc(h.name)}</strong><span>${esc(h.address)} · checked ${ago(h.checked_at)}</span></div>
+        <div class="host-title"><strong>${esc(h.name)}${kindLabel ? ` <span class="kind-tag">${kindLabel}</span>` : ""}</strong><span>${esc(h.address)} · checked ${ago(h.checked_at)}</span></div>
         <div class="host-meta">${meta}</div>
         <div class="host-actions">
           <button class="btn small" data-check="${esc(h.name)}" ${h.checking ? "disabled" : ""}>Check</button>
-          ${n && !h.job ? `<button class="btn small" data-update="${esc(h.name)}">Update host</button>` : ""}
+          ${targetActions(h.name, null, h, n, isPve ? "Update host" : "Update")}
           ${h.console ? `<a class="btn small" href="${esc(h.console)}" target="_blank" rel="noopener">Shell</a>` : ""}
         </div>
       </div>
       ${openPkgs.has(key) && n ? `<div class="row">${pkgList(hostPk)}</div>` : ""}
-      <div class="rows">${rows}</div>
+      ${rows ? `<div class="rows">${rows}</div>` : ""}
     </section>`;
 }
 
@@ -145,7 +175,8 @@ function render() {
   }
   const last = Math.max(0, ...state.hosts.map((h) => h.checked_at || 0));
   const next = state.next_check ? ` · next check ${clock(state.next_check)}` : "";
-  $("#summary").textContent = (total ? `${total} updates on ${targets} target${targets === 1 ? "" : "s"}` : "Everything up to date") + ` · checked ${ago(last || null)}${next}`;
+  const sched = state.maintenance && state.maintenance.scheduled ? ` · ${state.maintenance.scheduled} scheduled for ${windowLabel()}` : "";
+  $("#summary").textContent = (total ? `${total} updates on ${targets} target${targets === 1 ? "" : "s"}` : "Everything up to date") + ` · checked ${ago(last || null)}${next}${sched}`;
   const ctPending = state.hosts.some((h) => h.containers.some((c) => c.packages.length && !c.job && c.status === "running"));
   $("#update-all").disabled = !ctPending;
   $("#check-all").disabled = state.hosts.some((h) => h.checking);
@@ -188,7 +219,7 @@ function openLog(jobId, title) {
 
 async function startUpdate(host, vmid) {
   const ct = vmid == null ? null : state.hosts.find((h) => h.name === host).containers.find((c) => c.vmid === vmid);
-  if (vmid == null && !confirm(`Run apt dist-upgrade on the Proxmox host ${host}?`)) return;
+  if (vmid == null && !confirm(`Run apt dist-upgrade on ${host} now?`)) return;
   try {
     const job = await api("/api/update", { host, vmid, snapshot: $("#snapshot").checked });
     openLog(job.id, `Update · ${ct ? ct.name : host + " (host)"}`);
@@ -208,6 +239,18 @@ document.addEventListener("click", async (e) => {
     const k = t.dataset.pkgs;
     openPkgs.has(k) ? openPkgs.delete(k) : openPkgs.add(k);
     render();
+  } else if (t.dataset.schedule) {
+    try {
+      await api("/api/schedule", { host: t.dataset.schedule, vmid: t.dataset.vmid ? Number(t.dataset.vmid) : null, snapshot: $("#snapshot").checked });
+      await refresh();
+      toast(`Scheduled for the maintenance window (${windowLabel()})`);
+    } catch (err) { toast(err.message); }
+  } else if (t.dataset.unschedule) {
+    try {
+      await api("/api/schedule/cancel", { host: t.dataset.unschedule, vmid: t.dataset.vmid ? Number(t.dataset.vmid) : null });
+      toast("Removed from the maintenance window");
+      refresh();
+    } catch (err) { toast(err.message); }
   } else if (t.dataset.update) {
     startUpdate(t.dataset.update, t.dataset.vmid ? Number(t.dataset.vmid) : null);
   } else if (t.dataset.check) {
@@ -224,10 +267,18 @@ $("#check-all").addEventListener("click", async () => {
 
 $("#update-all").addEventListener("click", async () => {
   const snap = $("#snapshot").checked;
-  if (!confirm(`Update every container with pending updates${snap ? " (snapshot first)" : ""}? Proxmox hosts are not included.`)) return;
+  const cts = state.hosts.flatMap((h) => h.containers).filter((c) => c.packages.length && !c.job && !c.scheduled && c.status === "running");
+  const later = windowLabel() ? cts.filter((c) => c.maint_only).length : 0;
+  const msg = `Update ${cts.length - later} container${cts.length - later === 1 ? "" : "s"} now${snap ? " (snapshot first)" : ""}?`
+    + (later ? `\n${later} marked "maintenance window only" will be scheduled for ${windowLabel()} instead.` : "")
+    + "\nHosts are not included.";
+  if (!confirm(msg)) return;
   try {
     const r = await api("/api/update-all", { snapshot: snap });
-    toast(r.jobs.length ? `Queued ${r.jobs.length} update${r.jobs.length === 1 ? "" : "s"}` : "Nothing to update");
+    const parts = [];
+    if (r.jobs.length) parts.push(`Started ${r.jobs.length} update${r.jobs.length === 1 ? "" : "s"}`);
+    if (r.scheduled) parts.push(`${r.scheduled} scheduled for the maintenance window`);
+    toast(parts.join(" · ") || "Nothing to update");
     if (r.jobs.length) openLog(r.jobs[0].id);
     refresh();
   } catch (e) { toast(e.message); }

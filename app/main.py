@@ -20,7 +20,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import sshsetup
 from .notify import discord
-from .proxmox import Host, family
+from .proxmox import HOST_KINDS, Host, family
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("patchdeck")
@@ -50,6 +50,19 @@ def effective(raw):
     cfg["schedule"].setdefault("check_times", ["08:00"])
     cfg["schedule"].setdefault("days", list(range(7)))
     cfg["exclude"] = cfg.get("exclude") or []
+    if not isinstance(cfg.get("maintenance"), dict):
+        cfg["maintenance"] = {}
+    mw = cfg["maintenance"]
+    mw.setdefault("enabled", False)
+    mw.setdefault("days", list(range(7)))
+    mw.setdefault("start", "02:00")
+    mw.setdefault("end", "05:00")
+    for k in ("start", "end"):
+        if isinstance(mw[k], int):
+            mw[k] = f"{mw[k] // 60:02d}:{mw[k] % 60:02d}"
+        if not TIME_RE.match(str(mw[k])):
+            raise ValueError(f"Invalid maintenance {k} time {mw[k]!r}, use HH:MM")
+    cfg["maintenance_only"] = [str(t) for t in cfg.get("maintenance_only") or []]
     cfg["hosts"] = cfg.get("hosts") or []
     if os.environ.get("PATCHDECK_PASSWORD"):
         cfg["auth"]["password"] = os.environ["PATCHDECK_PASSWORD"]
@@ -71,11 +84,12 @@ CFG = effective(RAW)
 HOSTS = {}
 HOST_LOCKS = {}
 SCHEDULE_CHANGED = asyncio.Event()
+MAINT_CHANGED = asyncio.Event()
 
 
 def apply_config():
     """Rebuild everything derived from CFG."""
-    global SSH, KNOWN_HOSTS, KEY_FILE, HOSTS, SNAP, EXCLUDE, DISCORD
+    global SSH, KNOWN_HOSTS, KEY_FILE, HOSTS, SNAP, EXCLUDE, DISCORD, MAINT, MAINT_ONLY
     SSH = CFG["ssh"]
     kh = SSH.get("known_hosts", str(DATA_DIR / "known_hosts"))
     KNOWN_HOSTS = None if kh in ("none", "off", False) else kh
@@ -88,6 +102,7 @@ def apply_config():
             known_hosts=KNOWN_HOSTS,
             console_url=h.get("console_url", CFG.get("console_url")),
             host_console_url=h.get("host_console_url", CFG.get("host_console_url")),
+            kind=h.get("type", "pve"),
         )
         for h in CFG["hosts"]
     }
@@ -98,6 +113,8 @@ def apply_config():
             "on_failure": CFG["snapshots"].get("on_failure", "abort")}
     EXCLUDE = {int(v) for v in CFG["exclude"]}
     DISCORD = CFG["discord"]
+    MAINT = CFG["maintenance"]
+    MAINT_ONLY = set(CFG["maintenance_only"])
 
 
 apply_config()
@@ -120,6 +137,7 @@ def save_config():
     CFG = cfg
     apply_config()
     SCHEDULE_CHANGED.set()
+    MAINT_CHANGED.set()
 
 
 # ---------------------------------------------------------------- state
@@ -138,6 +156,7 @@ def _load(path, default):
 STATE = _load(STATE_FILE, {"hosts": {}, "notified": []})
 STATE.setdefault("hosts", {})
 STATE.setdefault("notified", [])
+STATE.setdefault("scheduled", [])  # updates waiting for the maintenance window
 STATE["next_check"] = None
 
 
@@ -152,6 +171,7 @@ class Job:
         self.id = secrets.token_hex(6)
         self.kind, self.host, self.vmid, self.name = kind, host, vmid, name
         self.snapshot, self.batch, self.auto = snapshot, batch, auto
+        self.quiet = False  # maintenance-window jobs report in one summary instead
         self.status = "queued"
         self.summary = ""
         self.lines = []
@@ -358,7 +378,7 @@ async def run_update(job):
 
 
 async def notify_update(job):
-    if not DISCORD.get("on_update", True) or not DISCORD.get("webhook"):
+    if job.quiet or not DISCORD.get("on_update", True) or not DISCORD.get("webhook"):
         return
     group = [job]
     if job.batch:
@@ -380,6 +400,9 @@ def queue_update(host, vmid, snapshot, batch=None):
     name = f"{host} (host)" if vmid is None else (find_ct(host, vmid) or {}).get("name", str(vmid))
     job = Job("update", host, vmid, name, snapshot=snapshot and vmid is not None, batch=batch)
     JOBS[job.id] = job
+    if is_scheduled(host, vmid):  # updating now replaces a pending maintenance-window update
+        STATE["scheduled"] = [i for i in STATE["scheduled"] if not (i["host"] == host and i["vmid"] == vmid)]
+        save_state()
     spawn(run_update(job))
     return job
 
@@ -423,11 +446,127 @@ async def scheduler():
             log.exception("Scheduled check failed")
 
 
+# ---------------------------------------------------------------- maintenance window
+
+def target_key(host, vmid):
+    return f"{host}/{'host' if vmid is None else vmid}"
+
+
+def is_scheduled(host, vmid):
+    return any(i["host"] == host and i["vmid"] == vmid for i in STATE["scheduled"])
+
+
+def window_at(day):
+    """The maintenance window that starts on `day`, as (start, end). End may be the next day."""
+    hh, mm = map(int, MAINT["start"].split(":"))
+    eh, em = map(int, MAINT["end"].split(":"))
+    start = dt.datetime.combine(day, dt.time(hh, mm))
+    end = dt.datetime.combine(day, dt.time(eh, em))
+    if end <= start:
+        end += dt.timedelta(days=1)
+    return start, end
+
+
+def next_window(now=None):
+    """The window in progress now, or the next one to start."""
+    if not MAINT.get("enabled") or not MAINT.get("days"):
+        return None
+    now = now or dt.datetime.now()
+    days = {int(d) for d in MAINT["days"]}
+    for offset in range(-1, 8):  # -1: a window that started yesterday may still be running
+        day = (now + dt.timedelta(days=offset)).date()
+        if day.weekday() not in days:
+            continue
+        start, end = window_at(day)
+        if end > now:
+            return start, end
+    return None
+
+
+def schedule_target(host, vmid, snapshot):
+    if host not in HOSTS:
+        raise HTTPException(404, "Unknown host")
+    if not next_window():
+        raise HTTPException(400, "Set up a maintenance window in Settings first")
+    if active_job(host, vmid):
+        raise HTTPException(409, "An update for this target is already running")
+    if not is_scheduled(host, vmid):
+        name = f"{host} (host)" if vmid is None else (find_ct(host, vmid) or {}).get("name", str(vmid))
+        STATE["scheduled"].append({"host": host, "vmid": vmid, "name": name,
+                                   "snapshot": bool(snapshot) and vmid is not None, "added": time.time()})
+        save_state()
+        MAINT_CHANGED.set()
+
+
+async def run_maintenance(end):
+    batch = "mw-" + secrets.token_hex(3)
+    items = list(STATE["scheduled"])
+    done, skipped = [], []
+    log.info("Maintenance window: %d scheduled update(s)", len(items))
+
+    async def per_host(host, its):
+        for it in its:
+            if dt.datetime.now() >= end:
+                return  # window over: leave the rest for next time
+            STATE["scheduled"] = [x for x in STATE["scheduled"] if x is not it]
+            save_state()
+            if host not in HOSTS or active_job(host, it["vmid"]):
+                continue
+            pending = (STATE["hosts"].get(host, {}).get("host", {}) if it["vmid"] is None
+                       else find_ct(host, it["vmid"]) or {}).get("packages")
+            if pending == []:
+                skipped.append(it["name"])
+                continue
+            job = Job("update", host, it["vmid"], it["name"], snapshot=it["snapshot"], batch=batch)
+            job.quiet = True
+            JOBS[job.id] = job
+            await run_update(job)
+            done.append(job)
+
+    by_host = {}
+    for it in items:
+        by_host.setdefault(it["host"], []).append(it)
+    await asyncio.gather(*(per_host(h, its) for h, its in by_host.items()))
+
+    left = [x for x in STATE["scheduled"] if any(x is i for i in items)]
+    if DISCORD.get("webhook") and (done or left):
+        icon = {"success": "✅", "failed": "❌"}
+        lines = ["🌙 **Maintenance window finished**"]
+        lines += [f"{icon.get(j.status, '•')} **{j.name}** `{j.host}`: {j.summary}" for j in done]
+        if skipped:
+            lines.append(f"➖ Already up to date: {', '.join(skipped)}")
+        if left:
+            lines.append(f"⏭️ Not reached before the window closed, moved to the next window: "
+                         f"{', '.join(x['name'] for x in left)}")
+        await discord(DISCORD["webhook"], "\n".join(lines))
+
+
+async def maintenance_loop():
+    while True:
+        MAINT_CHANGED.clear()
+        win = next_window()
+        now = dt.datetime.now()
+        if win and win[0] <= now < win[1] and STATE["scheduled"]:
+            try:
+                await run_maintenance(win[1])
+            except Exception:
+                log.exception("Maintenance run failed")
+            now = dt.datetime.now()
+        # Sleep until the window opens or closes, or until settings/the queue change.
+        wake = None if not win else (win[0] if now < win[0] else win[1])
+        wait = max(1, (wake - now).total_seconds()) if wake else None
+        try:
+            await asyncio.wait_for(MAINT_CHANGED.wait(), timeout=wait)
+        except asyncio.TimeoutError:
+            pass
+
+
 @contextlib.asynccontextmanager
 async def lifespan(app):
-    t = spawn(scheduler())
+    tasks = [spawn(scheduler()), spawn(maintenance_loop())]
     yield
-    t.cancel()
+    for t in tasks:
+        t.cancel()
 
 
 # ---------------------------------------------------------------- web
@@ -487,7 +626,8 @@ async def get_state():
         s = STATE["hosts"].get(name, {})
         node = s.get("node", name)
         default_ct = f"https://{h.address}:8006/?console=lxc&xtermjs=1&vmid={{vmid}}&node={{node}}"
-        default_host = f"https://{h.address}:8006/?console=shell&xtermjs=1&node={{node}}"
+        default_host = {"pve": f"https://{h.address}:8006/?console=shell&xtermjs=1&node={{node}}",
+                        "pbs": f"https://{h.address}:8007/"}.get(h.kind)
         containers = []
         for c in s.get("containers", []):
             if c["vmid"] in EXCLUDE:
@@ -497,10 +637,14 @@ async def get_state():
                                 name=c["name"], address=h.address, host=name)
             j = active_job(name, c["vmid"])
             c["job"] = j.public() if j else None
+            c["scheduled"] = is_scheduled(name, c["vmid"])
+            c["maint_only"] = target_key(name, c["vmid"]) in MAINT_ONLY
             containers.append(c)
         hj = active_job(name, None)
         hosts.append({
-            "name": name, "address": h.address, "node": node,
+            "name": name, "address": h.address, "node": node, "kind": h.kind,
+            "scheduled": is_scheduled(name, None),
+            "maint_only": target_key(name, None) in MAINT_ONLY,
             "host": s.get("host"), "containers": containers,
             "checked_at": s.get("checked_at"), "error": s.get("error"),
             "console": fill(h.host_console_url or default_host, node=node, address=h.address, host=name),
@@ -509,8 +653,31 @@ async def get_state():
                             for j in JOBS.values()),
         })
     jobs = sorted(JOBS.values(), key=lambda j: j.created, reverse=True)[:25]
+    win = next_window()
     return {"hosts": hosts, "jobs": [j.public() for j in jobs], "next_check": STATE.get("next_check"),
-            "snapshot_default": SNAP["enabled"], "snapshot_keep": SNAP["keep"]}
+            "snapshot_default": SNAP["enabled"], "snapshot_keep": SNAP["keep"],
+            "maintenance": {"next_start": win[0].timestamp() if win else None,
+                            "next_end": win[1].timestamp() if win else None,
+                            "scheduled": len(STATE["scheduled"])}}
+
+
+@app.post("/api/schedule")
+async def api_schedule(request: Request):
+    b = await _body(request)
+    vmid = b.get("vmid")
+    schedule_target(b.get("host"), int(vmid) if vmid is not None else None, bool(b.get("snapshot")))
+    return {"ok": True}
+
+
+@app.post("/api/schedule/cancel")
+async def api_schedule_cancel(request: Request):
+    b = await _body(request)
+    vmid = b.get("vmid")
+    vmid = int(vmid) if vmid is not None else None
+    STATE["scheduled"] = [i for i in STATE["scheduled"] if not (i["host"] == b.get("host") and i["vmid"] == vmid)]
+    save_state()
+    MAINT_CHANGED.set()
+    return {"ok": True}
 
 
 @app.post("/api/check")
@@ -540,14 +707,18 @@ async def api_update(request: Request):
 async def api_update_all(request: Request):
     body = await _body(request)
     batch = secrets.token_hex(4)
-    jobs = []
+    jobs, scheduled = [], 0
     for host, vmid, _, _ in pending_targets():
         if vmid is None and not body.get("include_hosts"):
             continue
-        if active_job(host, vmid):
+        if active_job(host, vmid) or is_scheduled(host, vmid):
+            continue
+        if target_key(host, vmid) in MAINT_ONLY and next_window():
+            schedule_target(host, vmid, bool(body.get("snapshot")))
+            scheduled += 1
             continue
         jobs.append(queue_update(host, vmid, bool(body.get("snapshot")), batch=batch).public())
-    return {"jobs": jobs}
+    return {"jobs": jobs, "scheduled": scheduled}
 
 
 @app.get("/api/jobs/{job_id}")
@@ -625,9 +796,10 @@ def bad(msg):
 def settings_payload():
     pub = sshsetup.public_key(KEY_FILE)
     nxt = next_run()
+    win = next_window()
     return {
         "hosts": [{
-            "name": h.name, "address": h.address, "port": h.port, "user": h.user,
+            "name": h.name, "address": h.address, "port": h.port, "user": h.user, "type": h.kind,
             "trusted": sshsetup.is_trusted(KNOWN_HOSTS, h.address, h.port) if KNOWN_HOSTS else None,
             "busy": host_busy(h.name),
             "connected": bool(STATE["hosts"].get(h.name, {}).get("checked_at"))
@@ -644,6 +816,14 @@ def settings_payload():
                     "on_check": DISCORD.get("on_check", "always"),
                     "on_update": bool(DISCORD.get("on_update", True))},
         "snapshots": SNAP,
+        "maintenance": {**MAINT, "next_start": win[0].timestamp() if win else None,
+                        "next_end": win[1].timestamp() if win else None},
+        "maintenance_only": sorted(MAINT_ONLY),
+        "targets": [{"host": n, "kind": h.kind, "containers": [
+            {"vmid": c["vmid"], "name": c["name"]}
+            for c in STATE["hosts"].get(n, {}).get("containers", []) if c["vmid"] not in EXCLUDE]}
+            for n, h in HOSTS.items()],
+        "host_kinds": HOST_KINDS,
         "base_url": CFG.get("base_url") or "",
         "exclude": sorted(EXCLUDE),
     }
@@ -694,6 +874,20 @@ async def api_settings_save(request: Request):
             bad("Invalid snapshot failure option")
         RAW["snapshots"] = {"enabled": bool(sn.get("enabled", True)), "keep": keep,
                             "on_failure": sn.get("on_failure", "abort")}
+    if "maintenance" in b:
+        m = b["maintenance"]
+        for k in ("start", "end"):
+            if not TIME_RE.match(str(m.get(k, ""))):
+                bad(f"Invalid {k} time; use HH:MM")
+        if m["start"] == m["end"]:
+            bad("Start and end can't be the same time")
+        days = sorted({int(d) for d in m.get("days", [])})
+        if any(d < 0 or d > 6 for d in days):
+            bad("Invalid day")
+        RAW["maintenance"] = {"enabled": bool(m.get("enabled")), "days": days,
+                              "start": m["start"], "end": m["end"]}
+    if "maintenance_only" in b:
+        RAW["maintenance_only"] = sorted({str(t) for t in b["maintenance_only"]})
     if "base_url" in b:
         RAW["base_url"] = str(b["base_url"]).strip()
     if "exclude" in b:
@@ -733,6 +927,9 @@ async def api_host_save(request: Request):
         bad("Enter an IP address or hostname")
     if not 1 <= port <= 65535:
         bad("Port must be 1-65535")
+    kind = b.get("type") or "pve"
+    if kind not in HOST_KINDS:
+        bad("Unknown host type")
     hosts = RAW.setdefault("hosts", []) or []
     RAW["hosts"] = hosts
     original = b.get("original")
@@ -745,17 +942,23 @@ async def api_host_save(request: Request):
         if name != original and any(h.get("name") == name for h in hosts):
             raise HTTPException(409, "A host with that name already exists")
         entry.update(name=name, address=address)
+        if kind == "pve":
+            entry.pop("type", None)
+        else:
+            entry["type"] = kind
         if port == 22:
             entry.pop("port", None)
         else:
             entry["port"] = port
         if name != original:
             STATE["hosts"].pop(original, None)
+            STATE["scheduled"] = [i for i in STATE["scheduled"] if i["host"] != original]
             save_state()
     else:
         if any(h.get("name") == name for h in hosts):
             raise HTTPException(409, "A host with that name already exists")
-        hosts.append({"name": name, "address": address, **({"port": port} if port != 22 else {})})
+        hosts.append({"name": name, "address": address, **({"port": port} if port != 22 else {}),
+                      **({"type": kind} if kind != "pve" else {})})
     save_config()
     return settings_payload()
 
@@ -768,6 +971,8 @@ async def api_host_delete(request: Request):
         raise HTTPException(409, "This host has a check or update running")
     RAW["hosts"] = [x for x in RAW.get("hosts") or [] if x.get("name") != h.name]
     STATE["hosts"].pop(h.name, None)
+    STATE["scheduled"] = [i for i in STATE["scheduled"] if i["host"] != h.name]
+    RAW["maintenance_only"] = [t for t in RAW.get("maintenance_only") or [] if not t.startswith(h.name + "/")]
     save_state()
     save_config()
     return settings_payload()

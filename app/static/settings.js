@@ -110,7 +110,7 @@ function hostCard(h) {
   return `
     <div class="host-card">
       <div class="host-card-head">
-        <div class="host-title"><strong>${esc(h.name)}</strong><span>${esc(h.user)}@${esc(h.address)}${h.port !== 22 ? ":" + h.port : ""}</span></div>
+        <div class="host-title"><strong>${esc(h.name)}${h.type !== "pve" ? ` <span class="kind-tag">${esc(S.host_kinds[h.type])}</span>` : ""}</strong><span>${esc(h.user)}@${esc(h.address)}${h.port !== 22 ? ":" + h.port : ""}</span></div>
         ${status}
         <div class="host-actions">
           ${ok ? `<button class="btn small ghost" data-act="expand" data-host="${esc(h.name)}">${expanded.has(h.name) ? "Hide setup" : "Setup & test"}</button>` : ""}
@@ -134,6 +134,10 @@ function hostForm(h) {
         <label class="field"><span>Name</span><input name="name" value="${esc(h ? h.name : "")}" placeholder="pve1" required></label>
         <label class="field grow"><span>IP address or hostname</span><input name="address" value="${esc(h ? h.address : "")}" placeholder="192.168.1.10" required></label>
         <label class="field narrow"><span>SSH port</span><input name="port" type="number" min="1" max="65535" value="${h ? h.port : 22}"></label>
+        <label class="field"><span>Type</span>
+          <select name="type">${Object.entries(S.host_kinds).map(([k, label]) =>
+            `<option value="${k}" ${(h ? h.type : "pve") === k ? "selected" : ""}>${esc(label)}</option>`).join("")}</select>
+        </label>
       </div>
       <div class="form-actions">
         <button class="btn primary small">${isEdit ? "Save" : "Add host"}</button>
@@ -168,6 +172,41 @@ function scheduleSection() {
     <div class="form-actions"><button class="btn primary small" data-act="save-schedule">Save schedule</button></div>`;
 }
 
+function maintenanceSection() {
+  const m = S.maintenance;
+  const fmt = (ts, opts) => new Date(ts * 1000).toLocaleString([], opts);
+  const next = m.enabled && m.next_start
+    ? `${fmt(m.next_start, { weekday: "short", hour: "2-digit", minute: "2-digit" })} – ${fmt(m.next_end, { hour: "2-digit", minute: "2-digit" })}`
+    : "off";
+  const only = new Set(S.maintenance_only);
+  const box = (key, label) => `<label class="check"><input type="checkbox" name="only" value="${esc(key)}" ${only.has(key) ? "checked" : ""}> ${esc(label)}</label>`;
+  const groups = S.targets.map((t) => `
+    <div class="group"><strong>${esc(t.host)}</strong>
+      <div class="opts">
+        ${box(`${t.host}/host`, t.kind === "pve" ? "The Proxmox host itself" : "This server")}
+        ${t.containers.map((c) => box(`${t.host}/${c.vmid}`, `${c.name} (${c.vmid})`)).join("")}
+      </div>
+    </div>`).join("");
+  return `
+    <form data-form="maint">
+      <p>Click 🌙 next to any Update button to run that update in the window instead of straight away.
+        Scheduled updates run one at a time per host; anything not started by the end time waits for the next window.</p>
+      <label class="check"><input type="checkbox" name="enabled" ${m.enabled ? "checked" : ""}> Enable the maintenance window</label>
+      <div class="field"><span>Days</span>
+        <div class="days">${DAYS.map((name, i) => `<button type="button" class="day mday ${m.days.includes(i) ? "on" : ""}" data-mday="${i}" aria-pressed="${m.days.includes(i)}">${name}</button>`).join("")}</div>
+      </div>
+      <div class="window-row">
+        <label class="field"><span>Starts</span><input type="time" name="start" value="${esc(m.start)}" required></label>
+        <label class="field"><span>Ends</span><input type="time" name="end" value="${esc(m.end)}" required></label>
+      </div>
+      <p class="hint">Next window: <strong>${esc(next)}</strong> (server time). An end time earlier than the start runs past midnight.</p>
+      <div class="field"><span>Always use the window for these (their button becomes 🌙 Schedule, and Update all skips them)</span>
+        <div class="targets">${groups || `<span class="muted">Add hosts and run a check first.</span>`}</div>
+      </div>
+      <div class="form-actions"><button class="btn primary small">Save</button></div>
+    </form>`;
+}
+
 function discordSection() {
   const d = S.discord;
   return `
@@ -183,7 +222,8 @@ function discordSection() {
           <option value="off" ${d.on_check === "off" ? "selected" : ""}>Don't send</option>
         </select>
       </label>
-      <label class="check"><input type="checkbox" name="on_update" ${d.on_update ? "checked" : ""}> Send a message when updates finish</label>
+      <label class="check"><input type="checkbox" name="on_update" ${d.on_update ? "checked" : ""}> Send a message when updates you start finish</label>
+      <p class="hint">A summary is always sent after each maintenance window that ran updates.</p>
       <div class="form-actions">
         <button class="btn primary small">Save</button>
         <button type="button" class="btn small" data-act="discord-test" ${d.webhook_set ? "" : "disabled"}>Send test message</button>
@@ -228,6 +268,7 @@ const SECTIONS = [
   ["hosts", "Proxmox hosts", hostsSection],
   ["key", "Patchdeck SSH key", keySection],
   ["schedule", "Check schedule", scheduleSection],
+  ["maintenance", "Maintenance window", maintenanceSection],
   ["discord", "Discord notifications", discordSection],
   ["snapshots", "Snapshots", snapshotSection],
   ["general", "General", generalSection],
@@ -267,6 +308,11 @@ $("#view-settings").addEventListener("click", async (e) => {
   const b = e.target.closest("button");
   if (!b) return;
   if (b.dataset.copy !== undefined) return copyText(b.dataset.copy);
+  if (b.dataset.mday !== undefined) {
+    const on = b.classList.toggle("on");
+    b.setAttribute("aria-pressed", on);
+    return;
+  }
   if (b.dataset.day !== undefined) {
     const d = Number(b.dataset.day);
     schedDraft.days = schedDraft.days.includes(d) ? schedDraft.days.filter((x) => x !== d) : [...schedDraft.days, d].sort();
@@ -308,7 +354,7 @@ $("#view-settings").addEventListener("click", async (e) => {
     case "edit-cancel": editing.delete(host); renderSettings(["hosts"]); break;
     case "remove":
       if (!confirm(`Remove ${host} from Patchdeck? Its containers will disappear from the dashboard. Nothing changes on the host.`)) return;
-      applySettings(await act(b, "/api/hosts/delete", { name: host }, "Removing…"), ["hosts", "schedule"]);
+      applySettings(await act(b, "/api/hosts/delete", { name: host }, "Removing…"), ["hosts", "schedule", "maintenance"]);
       refresh();
       break;
     case "add-time":
@@ -345,11 +391,11 @@ $("#view-settings").addEventListener("submit", async (e) => {
   switch (f.dataset.form) {
     case "host": {
       const original = f.dataset.original;
-      const r = await act(btn, "/api/hosts", { name: v("name").trim(), address: v("address").trim(), port: Number(v("port") || 22), original }, "Saving…");
+      const r = await act(btn, "/api/hosts", { name: v("name").trim(), address: v("address").trim(), port: Number(v("port") || 22), type: v("type"), original }, "Saving…");
       if (r) {
         if (original) { editing.delete(original); delete tested[original]; delete fp[original]; }
         toast(original ? "Host saved" : `${v("name")} added. Now trust its fingerprint`);
-        applySettings(r, ["hosts", "schedule"]);
+        applySettings(r, ["hosts", "schedule", "maintenance"]);
         refresh();
       }
       break;
@@ -365,6 +411,16 @@ $("#view-settings").addEventListener("submit", async (e) => {
         renderSettings(["hosts"]);
         if (tested[host].ok) refresh();
       }
+      break;
+    }
+    case "maint": {
+      const days = [...f.querySelectorAll(".mday.on")].map((x) => Number(x.dataset.mday));
+      const only = [...f.querySelectorAll('input[name="only"]:checked')].map((x) => x.value);
+      const r = await act(btn, "/api/settings", {
+        maintenance: { enabled: f.elements.enabled.checked, days, start: v("start"), end: v("end") },
+        maintenance_only: only,
+      }, "Saving…");
+      if (r) { toast("Maintenance window saved"); applySettings(r, ["maintenance"]); refresh(); }
       break;
     }
     case "discord": {

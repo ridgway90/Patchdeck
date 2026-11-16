@@ -10,6 +10,9 @@ A small, self-hosted update dashboard for Proxmox VE hosts and their LXC contain
 - **Live log** of each update in the page
 - **Console** buttons that open the Proxmox console (or Nexterm, or any URL you configure)
 - Scheduled checks with a **Discord** summary, plus a message when updates finish
+- **Maintenance window**: click 🌙 to run an update out of hours instead of now, or mark
+  containers to always wait for the window; one Discord summary per window
+- **Proxmox Backup Server** and plain Debian/Ubuntu servers can be added as hosts too
 - Debian, Ubuntu, Devuan and Alpine containers
 
 It connects only to your Proxmox hosts over SSH and runs commands inside containers with
@@ -46,7 +49,8 @@ Or with Docker: create `data/config.yaml` the same way, then `docker compose up 
 Open `http://<ip>:8080`, sign in, and go to **Settings**:
 
 1. **Generate SSH key**: Patchdeck creates its own key in `data/`.
-2. **Add a host**: name, IP and SSH port for each Proxmox host.
+2. **Add a host**: name, IP, SSH port and type (Proxmox VE, Proxmox Backup Server, or another
+   Debian/Ubuntu server) for each machine.
 3. **Trust the fingerprint**: Patchdeck shows the host's SSH fingerprint and the command to check
    it on the host (`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` in the Proxmox shell).
    Confirm they match and click **It matches, trust it**.
@@ -54,7 +58,8 @@ Open `http://<ip>:8080`, sign in, and go to **Settings**:
    or copy the command shown and paste it into the host's shell yourself.
 5. **Test connection**, then go back to the Dashboard and click **Check now**.
 
-Also in Settings: check schedule (days and times), Discord webhook and test message, snapshot
+Also in Settings: the maintenance window (days, start and end time, and which targets always
+use it), check schedule (days and times), Discord webhook and test message, snapshot
 defaults, the dashboard address used in Discord links, and container IDs to hide.
 
 Settings are saved to `data/config.yaml` (the first save keeps a copy as `config.yaml.bak`).

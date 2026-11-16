@@ -66,6 +66,7 @@ h1, h2 { margin: 0; }
 }
 .brand { display: flex; gap: 12px; align-items: center; }
 .logo {
+  flex: none;
   width: 34px; height: 34px; border-radius: 9px; background: var(--accent);
   background-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><path d='M9 17l5 5 9-11' stroke='white' stroke-width='3.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>");
 }
@@ -116,7 +117,7 @@ main { max-width: 1040px; margin: 0 auto; padding: 20px 16px 120px; display: gri
 
 .row {
   display: grid;
-  grid-template-columns: minmax(0, 1.6fr) 90px minmax(0, 1.4fr) 170px;
+  grid-template-columns: minmax(0, 1.6fr) 90px minmax(0, 1.3fr) 210px;
   gap: 12px; align-items: center;
   padding: 10px 16px 10px 52px;
   border-bottom: 1px solid var(--border);
@@ -283,3 +284,17 @@ form.inline input { flex: 1 1 200px; max-width: 320px; }
   .tabs { order: 3; width: 100%; }
   .tab { flex: 1; text-align: center; }
 }
+
+/* ---------- maintenance window ---------- */
+.btn.icon { padding: 4px 7px; }
+.btn.sched { background: var(--info-bg); color: var(--info); border-color: transparent; }
+.btn.sched span { opacity: .6; margin-left: 2px; }
+.btn.sched:hover span { opacity: 1; }
+.kind-tag { font-size: 11px; font-weight: 600; color: var(--muted); border: 1px solid var(--border); border-radius: 5px; padding: 1px 6px; margin-left: 6px; vertical-align: 2px; }
+.targets { display: grid; gap: 10px; }
+.targets .group { display: grid; gap: 4px; }
+.targets .group > strong { font-size: 13px; }
+.targets .opts { display: flex; flex-wrap: wrap; gap: 4px 16px; }
+.targets .check { font-size: 13.5px; }
+.window-row { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; }
+.window-row .field { flex: 0 1 140px; }
