@@ -15,8 +15,9 @@ APT_FAMILY = {"debian", "ubuntu", "devuan", "raspbian", "linuxmint", "pop", "kal
 APK_FAMILY = {"alpine"}
 
 # Lists pending updates. Prints __UPDATE_FAILED__ if the package index could not be refreshed.
+APT_LOCK = "-o DPkg::Lock::Timeout=300"
 APT_LIST = (
-    "apt-get update -qq >/dev/null 2>&1 || echo __UPDATE_FAILED__; "
+    "apt-get -o DPkg::Lock::Timeout=60 update -qq >/dev/null 2>&1 || echo __UPDATE_FAILED__; "
     "apt list --upgradable 2>/dev/null"
 )
 APK_LIST = (
@@ -25,9 +26,9 @@ APK_LIST = (
 )
 APT_UPGRADE = (
     "export DEBIAN_FRONTEND=noninteractive; "
-    "apt-get update && "
-    "apt-get -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold dist-upgrade && "
-    "apt-get -y autoremove"
+    f"apt-get {APT_LOCK} update && "
+    f"apt-get {APT_LOCK} -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold dist-upgrade && "
+    f"apt-get {APT_LOCK} -y autoremove"
 )
 APK_UPGRADE = "apk update && apk upgrade"
 CT_REBOOT = "[ -f /var/run/reboot-required ] && echo yes || echo no"
@@ -40,12 +41,13 @@ HOST_REBOOT = (
 )
 
 APT_LINE = re.compile(r"^(\S+?)/\S+\s+(\S+)\s+\S+\s+\[upgradable from: ([^\]]+)\]")
-APK_LINE = re.compile(r"^(\S+?)-(\d\S*)\s+<\s+(\S+)")
+APK_LINE = re.compile(r"^(\S+)-(\d[^\s-]*(?:-r\d+)?)\s+<\s+(\S+)")
 SNAP_NAME = re.compile(r"(pre-update-\d{8}-\d{6})")
 RC_MARK = "__PATCHDECK_RC__"
 
 
-DOCKER_LS = ("command -v docker >/dev/null 2>&1 || { echo __NODOCKER__; exit 0; }; "
+DOCKER_ENV = 'export HOME="${HOME:-/root}"; '
+DOCKER_LS = (DOCKER_ENV + "command -v docker >/dev/null 2>&1 || { echo __NODOCKER__; exit 0; }; "
              "docker compose version >/dev/null 2>&1 || { echo __NOCOMPOSE__; exit 0; }; "
              "docker compose ls --all --format json")
 
@@ -66,7 +68,7 @@ def images_script(stacks):
             f"docker compose {compose_args(st['name'], st['files'])} config --images 2>/dev/null | sort -u | "
             "while read -r img; do echo \"__IMG__ $img\"; "
             "docker image inspect --format '{{json .RepoDigests}}' \"$img\" 2>/dev/null || echo __MISSING__; done")
-    return "; ".join(parts)
+    return DOCKER_ENV + "; ".join(parts)
 
 
 def parse_images(out, stacks):
@@ -90,7 +92,7 @@ def parse_images(out, stacks):
 
 def stack_update_script(name, files, prune=True):
     args = compose_args(name, files)
-    script = (f"cd {shlex.quote(os.path.dirname(files[0]) or '/')} && "
+    script = (DOCKER_ENV + f"cd {shlex.quote(os.path.dirname(files[0]) or '/')} && "
               f"docker compose --ansi never {args} pull && docker compose --ansi never {args} up -d")
     if prune:
         script += " && docker image prune -f"
@@ -154,7 +156,10 @@ class Host:
 
     @staticmethod
     async def _run(conn, cmd, timeout=300, check=True):
-        r = await conn.run(cmd, check=False, timeout=timeout)
+        try:
+            r = await conn.run(cmd, check=False, timeout=timeout)
+        except asyncssh.TimeoutError:
+            raise RuntimeError(f"`{cmd.split(' --')[0][:60]}` timed out after {int(timeout)}s") from None
         if check and r.exit_status != 0:
             err = (r.stderr or r.stdout or "").strip().splitlines()
             raise RuntimeError(f"`{cmd.split(' --')[0][:60]}` failed: {err[-1] if err else r.exit_status}")
@@ -231,7 +236,7 @@ class Host:
         return {"vmid": int(g["vmid"]), "type": kind, "name": g.get("name") or str(g["vmid"]),
                 "status": g.get("status"), "os": None, "packages": [], "reboot": False,
                 "error": None, "warning": None, "checked_at": time.time(),
-                "stacks": None, "docker_error": None}
+                "stacks": None, "docker_error": None, "unsupported": False}
 
     @staticmethod
     def _fill(entry, fam, out):
@@ -252,7 +257,7 @@ class Host:
                 return entry
             fam = family(entry["os"])
             if not fam:
-                entry["error"] = f"Unsupported OS type: {entry['os']}"
+                entry["error"], entry["unsupported"] = f"Unsupported OS type: {entry['os']}", True
                 return entry
             listing_cmd = APT_LIST if fam == "apt" else APK_LIST
             self._fill(entry, fam, await self._run(conn, ct_cmd(vmid, f"{listing_cmd}; echo __REBOOT__; {CT_REBOOT}")))
@@ -352,7 +357,7 @@ class Host:
                 entry["os_name"] = os_name or entry["os_name"]
                 return entry
             if not fam:
-                entry["error"] = f"Unsupported OS: {info.get('pretty-name') or entry['os']}"
+                entry["error"], entry["unsupported"] = f"Unsupported OS: {info.get('pretty-name') or entry['os']}", True
                 return entry
             listing_cmd = APT_LIST if fam == "apt" else APK_LIST
             _, out, _ = await self._guest_exec(conn, vmid, f"{listing_cmd}; echo __REBOOT__; {CT_REBOOT}")
@@ -410,30 +415,52 @@ class Host:
     # ---------- actions ----------
 
     async def stream(self, cmd, on_line):
-        """Run cmd detached on the host (so a dropped SSH session can't kill apt halfway),
-        and stream its output. Returns the command's exit code."""
+        """Run cmd detached on the host and stream its output. Returns the command's exit code.
+
+        The command keeps running if the SSH connection drops (or Patchdeck's network blips);
+        the log is then followed again from where it stopped.
+        """
         log = f"/tmp/patchdeck-{secrets.token_hex(6)}.log"
         inner = f"( {cmd} ); echo {RC_MARK}$?"  # subshell: the marker is written even if cmd exits
-        # Create the log before starting the job: the background shell opens it asynchronously,
-        # and tail would otherwise race it and exit with "No such file". Keep the log if the
-        # job never reported an exit code, so it can be inspected on the host.
-        wrapped = (
-            f": > {log}; "
-            f"setsid nohup sh -c {shlex.quote(inner)} >> {log} 2>&1 < /dev/null & PID=$!; "
-            f"tail -n +1 -F --pid=$PID {log} 2>/dev/null; "
-            f"grep -q {RC_MARK} {log} && rm -f {log}"
-        )
-        rc = None
+        # The log is created before the job starts so following it can never race its creation.
+        start = f": > {log}; setsid nohup sh -c {shlex.quote(inner)} >> {log} 2>&1 < /dev/null & echo $!"
         async with self._connect() as conn:
-            async with conn.create_process(wrapped, stderr=asyncssh.STDOUT,
-                                           encoding="utf-8", errors="replace") as proc:
-                async for line in proc.stdout:
-                    line = line.rstrip("\n")
-                    if line.startswith(RC_MARK):
-                        rc = int(line[len(RC_MARK):] or 1)
-                        continue
-                    on_line(line)
-                await proc.wait()
+            pid = int((await self._run(conn, start, timeout=30)).strip())
+        offset, buf, rc, fails = 0, b"", None, 0
+        mark = RC_MARK.encode()
+        while rc is None:
+            try:
+                async with self._connect() as conn:
+                    follow = f"tail -c +{offset + 1} -F --pid={pid} {log} 2>/dev/null"
+                    async with conn.create_process(follow, encoding=None) as proc:
+                        while True:
+                            chunk = await proc.stdout.read(65536)
+                            if not chunk:
+                                break
+                            fails = 0
+                            offset += len(chunk)
+                            buf += chunk
+                            *lines, buf = buf.split(b"\n")
+                            for raw in lines:
+                                if raw.startswith(mark):
+                                    rc = int(raw[len(mark):].strip() or 1)
+                                else:
+                                    on_line(raw.decode("utf-8", "replace").rstrip("\r"))
+                        await proc.wait()
+                        finished = proc.exit_status is not None  # None: the connection went away
+                    if rc is not None:
+                        await conn.run(f"rm -f {log}", check=False, timeout=30)
+                    elif finished:
+                        break  # the job ended without reporting an exit code
+            except (OSError, asyncssh.Error, asyncio.TimeoutError) as e:
+                finished = False
+            if rc is None and not finished:
+                fails += 1
+                if fails > 20:
+                    break
+                if fails == 1:
+                    on_line("(connection to the host lost; the update keeps running, reconnecting…)")
+                await asyncio.sleep(min(30, 3 * fails))
         if rc is None:
             raise RuntimeError(f"Lost track of the update before it finished. It may still be running on "
                                f"the host; its output is in {log}. Run a check again in a few minutes.")

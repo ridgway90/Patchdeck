@@ -144,6 +144,7 @@ function renderRow(host, c) {
   let stateHtml;
   if (c.job) stateHtml = jobPill(c.job);
   else if (!running) stateHtml = `<span class="pill">${esc(c.status || "unknown")}</span>`;
+  else if (c.unsupported) stateHtml = `<span class="pill" title="${esc(c.error)}. Patchdeck can't update this one; hide it under Settings → General if you like.">Not supported</span>`;
   else if (c.error) stateHtml = `<span class="pill bad">Check failed</span><span class="err" title="${esc(c.error)}">${esc(c.error)}</span>`;
   else stateHtml = n ? `<button class="pill ${n >= 20 ? "bad" : "warn"}" data-pkgs="${esc(key)}" title="Show packages">${n} update${n === 1 ? "" : "s"} ▾</button>` : countPill(0);
   if (c.reboot) stateHtml += `<span class="pill bad">Reboot needed</span>`;
@@ -220,11 +221,18 @@ function allStacks() {
   return out;
 }
 
+const lastHtml = new WeakMap();
+function setHtml(el, html) {
+  if (lastHtml.get(el) === html) return;
+  lastHtml.set(el, html);
+  el.innerHTML = html;
+}
+
 function render() {
   if (!state) return;
-  $("#hosts").innerHTML = state.hosts.length ? state.hosts.map(renderHost).join("")
-    : `<section class="panel empty-state"><strong>No Proxmox hosts yet</strong><p class="muted">Add your hosts and set up SSH access in <a href="#settings">Settings</a>.</p></section>`;
-  $("#jobs").innerHTML = renderJobs(state.jobs);
+  setHtml($("#hosts"), state.hosts.length ? state.hosts.map(renderHost).join("")
+    : `<section class="panel empty-state"><strong>No Proxmox hosts yet</strong><p class="muted">Add your hosts and set up SSH access in <a href="#settings">Settings</a>.</p></section>`);
+  setHtml($("#jobs"), renderJobs(state.jobs));
 
   let total = 0, targets = 0;
   for (const h of state.hosts) {
@@ -238,7 +246,7 @@ function render() {
   const sched = (stacksPending.length ? ` · ${stacksPending.length} Docker stack${stacksPending.length === 1 ? "" : "s"} with updates` : "")
     + (state.scheduled_count ? ` · ${state.scheduled_count} scheduled` : "");
   $("#summary").textContent = (total ? `${total} updates on ${targets} target${targets === 1 ? "" : "s"}` : "Everything up to date") + ` · checked ${ago(last || null)}${next}${sched}`;
-  const ctPending = stacksPending.length || state.hosts.some((h) => h.containers.some((c) => c.packages.length && !c.job && c.status === "running"));
+  const ctPending = stacksPending.length || state.hosts.some((h) => h.containers.some((c) => c.packages.length && !c.job && !c.scheduled && c.status === "running"));
   $("#update-all").disabled = !ctPending;
   $("#check-all").disabled = state.hosts.some((h) => h.checking);
 }
@@ -252,8 +260,9 @@ async function refresh() {
   }
   const busy = state && (state.jobs.some((j) => j.status === "running" || j.status === "queued"));
   clearTimeout(pollTimer);
-  pollTimer = setTimeout(refresh, busy ? 2500 : 30000);
+  if (!document.hidden) pollTimer = setTimeout(refresh, busy ? 2500 : 30000);
 }
+document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
 
 function openLog(jobId, title) {
   if (logSource) logSource.close();
@@ -268,6 +277,7 @@ function openLog(jobId, title) {
   $("#log").hidden = false;
   const src = new EventSource(`/api/jobs/${encodeURIComponent(jobId)}/stream`);
   logSource = src;
+  src.addEventListener("open", () => { body.textContent = ""; });
   src.addEventListener("line", (e) => {
     const stick = body.scrollTop + body.clientHeight >= body.scrollHeight - 30;
     body.textContent += JSON.parse(e.data) + "\n";

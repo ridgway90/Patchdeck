@@ -4,6 +4,7 @@ import base64
 import contextlib
 import copy
 import datetime as dt
+import hashlib
 import json
 import logging
 import os
@@ -110,7 +111,13 @@ def effective(raw):
     cfg["docker"] = {"enabled": bool(dk.get("enabled", True)), "prune": bool(dk.get("prune", True)),
                      "logins": logins}
     cfg["maintenance"], cfg["schedules"] = normalise_maintenance(cfg)
-    cfg["hosts"] = cfg.get("hosts") or []
+    hosts = []
+    for h in cfg.get("hosts") or []:
+        if isinstance(h, dict) and h.get("name") and h.get("address"):
+            hosts.append({**h, "name": str(h["name"]), "address": str(h["address"])})
+        else:
+            log.warning("Ignoring host entry without a name and address in config.yaml: %r", h)
+    cfg["hosts"] = hosts
     if os.environ.get("PATCHDECK_PASSWORD"):
         cfg["auth"]["password"] = os.environ["PATCHDECK_PASSWORD"]
     if os.environ.get("DISCORD_WEBHOOK"):
@@ -177,14 +184,39 @@ def save_config():
     if CONFIG_PATH.exists() and not backup.exists():
         shutil.copy2(CONFIG_PATH, backup)
     tmp = CONFIG_PATH.with_suffix(".tmp")
-    tmp.write_text("# Managed by Patchdeck's Settings page; comments are not preserved.\n"
-                   + yaml.safe_dump(RAW, sort_keys=False, allow_unicode=True))
+    text = ("# Managed by Patchdeck's Settings page; comments are not preserved.\n"
+            + yaml.safe_dump(RAW, sort_keys=False, allow_unicode=True))
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)  # holds secrets: never world-readable
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
     os.chmod(tmp, 0o600)
     tmp.replace(CONFIG_PATH)
     CFG = cfg
     apply_config()
     SCHEDULE_CHANGED.set()
     MAINT_CHANGED.set()
+
+
+@contextlib.contextmanager
+def config_edit():
+    """Edit RAW inside this block; it is validated and saved on exit. If anything fails, RAW is
+    put back as it was, so one rejected change can't poison later saves."""
+    backup = copy.deepcopy(RAW)
+    try:
+        yield
+        save_config()
+    except HTTPException:
+        RAW.clear(); RAW.update(backup)
+        raise
+    except (ValueError, SystemExit) as e:
+        RAW.clear(); RAW.update(backup)
+        raise HTTPException(400, str(e) or "Invalid settings")
+    except (TypeError, AttributeError, KeyError):
+        RAW.clear(); RAW.update(backup)
+        raise HTTPException(400, "Invalid settings")
+    except BaseException:
+        RAW.clear(); RAW.update(backup)
+        raise
 
 
 # ---------------------------------------------------------------- state
@@ -276,7 +308,9 @@ def save_jobs():
         if JOBS[j] not in recent:
             del JOBS[j]
     data = [dict(j.public(), lines=j.lines[-400:]) for j in recent]
-    JOBS_FILE.write_text(json.dumps(data))
+    tmp = JOBS_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data))
+    tmp.replace(JOBS_FILE)
 
 
 def spawn(coro):
@@ -331,7 +365,10 @@ async def annotate_docker(entries):
 # ---------------------------------------------------------------- checks
 
 async def run_check(job):
-    h = HOSTS[job.host]
+    h = HOSTS.get(job.host)
+    if h is None:
+        job.start()
+        return job.finish("failed", "Host was removed")
     async with HOST_LOCKS[job.host]:
         job.start()
         job.log(f"Connecting to {h.address}…")
@@ -344,7 +381,8 @@ async def run_check(job):
             save_state()
             n_ct = sum(len(c["packages"]) for c in result["containers"])
             for c in result["containers"]:
-                detail = c["error"] or (c["status"] if c["status"] != "running" else f"{len(c['packages'])} updates")
+                detail = (c["status"] if c["status"] != "running" else
+                          c["error"] or f"{len(c['packages'])} updates")
                 job.log(f"  {c['vmid']:>5}  {c['name']:<24} {detail}")
                 for st in c.get("stacks") or []:
                     job.log(f"         🐳 {st['name']:<21} {st.get('updates', 0)} image update(s)")
@@ -416,7 +454,8 @@ async def notify_check():
     for h, vmid, st, name, n in stacks:
         lines.append(f"🐳 **{name}** `{h}`: {n} image{'s' if n != 1 else ''}")
     errors = [f"{n}/{c['name']}" for n, h in STATE["hosts"].items()
-              for c in h.get("containers", []) if c.get("error")]
+              for c in h.get("containers", [])
+              if c.get("error") and not c.get("unsupported") and c["vmid"] not in EXCLUDE]
     errors += [n for n, h in STATE["hosts"].items() if h.get("error")]
     if errors:
         lines.append(f"⚠️ Could not check: {', '.join(errors)}")
@@ -475,12 +514,17 @@ async def run_stack_update(job):
             if rc == 0 and job.snapshot and kind != "host":
                 await prune_snapshots(job, h, kind)
             job.log("Re-checking images…")
-            await refresh_docker(job.host, job.vmid)
-            after = find_stack(job.host, job.vmid, job.stack) or {}
+            try:
+                await refresh_docker(job.host, job.vmid)
+                after = find_stack(job.host, job.vmid, job.stack) or {}
+                result = f"{before} → {after.get('updates', 0)} image update(s)"
+            except Exception as e:
+                job.log(f"Re-check failed: {e}")
+                result = "updated · re-check failed, run a check"
             if rc != 0:
                 job.finish("failed", f"exit code {rc}")
             else:
-                job.finish("success", f"{before} → {after.get('updates', 0)} image update(s)")
+                job.finish("success", result)
         except Exception as e:
             job.log(f"ERROR: {e}")
             job.finish("failed", str(e))
@@ -522,26 +566,43 @@ async def run_update(job):
                 if rc == 0 and job.snapshot:
                     await prune_snapshots(job, h, kind)
             job.log("Re-checking…")
-            after = await recheck(job)
             notes = []
-            if rc == 0 and after.get("reboot") and job.reboot:
-                if kind == "host":
-                    job.log("Reboot required: rebooting the host in 1 minute")
-                    await h.reboot_self()
-                    notes.append("rebooting")
-                    spawn(delayed_check(job.host, 420))
-                else:
-                    job.log(f"Reboot required: rebooting {job.name}…")
-                    is_win = (find_ct(job.host, job.vmid) or {}).get("os") == "mswindows"
-                    await h.reboot_guest(job.vmid, kind, job.log, wait=1200 if is_win else 300)
-                    after = await recheck(job)
-                    notes.append("rebooted")
-            elif after.get("reboot"):
+            try:
+                after = await recheck(job)
+            except Exception as e:
+                after = None
+                job.log(f"Re-check failed: {e}")
+                notes.append("re-check failed, run a check")
+            if rc == 0 and after and after.get("reboot") and job.reboot:
+                try:
+                    if kind == "host":
+                        job.log("Reboot required: rebooting the host in 1 minute")
+                        await h.reboot_self()
+                        notes.append("rebooting")
+                        spawn(delayed_check(job.host, 420))
+                    else:
+                        job.log(f"Reboot required: rebooting {job.name}…")
+                        is_win = (find_ct(job.host, job.vmid) or {}).get("os") == "mswindows"
+                        if await h.reboot_guest(job.vmid, kind, job.log, wait=1200 if is_win else 300):
+                            notes.append("rebooted")
+                            try:
+                                after = await recheck(job)
+                                if after.get("reboot"):
+                                    notes.append("another reboot needed")
+                            except Exception as e:
+                                job.log(f"Re-check after reboot failed: {e}")
+                        else:
+                            notes.append("rebooting, not back yet")
+                except Exception as e:
+                    job.log(f"Reboot failed: {e}")
+                    notes.append("reboot failed")
+            elif after and after.get("reboot"):
                 notes.append("reboot required")
             if rc != 0:
                 job.finish("failed", f"exit code {rc}")
             else:
-                job.finish("success", " · ".join([f"{before} → {len(after['packages'])} pending"] + notes))
+                head = f"{before} → {len(after['packages'])} pending" if after else "updated"
+                job.finish("success", " · ".join([head] + notes))
         except Exception as e:
             job.log(f"ERROR: {e}")
             job.finish("failed", str(e))
@@ -909,12 +970,22 @@ def fill(template, **kw):
 
 
 @app.get("/api/state")
-async def get_state():
+async def get_state(request: Request):
+    body = json.dumps(build_state(), separators=(",", ":")).encode()
+    etag = f'"{hashlib.sha1(body).hexdigest()}"'
+    headers = {"ETag": etag, "Cache-Control": "no-cache"}
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers=headers)
+    return Response(body, media_type="application/json", headers=headers)
+
+
+def build_state():
     hosts = []
     for name, h in HOSTS.items():
         s = STATE["hosts"].get(name, {})
         node = s.get("node", name)
         default_ct = f"https://{h.address}:8006/?console=lxc&xtermjs=1&vmid={{vmid}}&node={{node}}"
+        default_vm = f"https://{h.address}:8006/?console=kvm&novnc=1&vmid={{vmid}}&node={{node}}"
         default_host = {"pve": f"https://{h.address}:8006/?console=shell&xtermjs=1&node={{node}}",
                         "pbs": f"https://{h.address}:8007/"}.get(h.kind)
         containers = []
@@ -922,7 +993,8 @@ async def get_state():
             if c["vmid"] in EXCLUDE:
                 continue
             c = dict(c)
-            c["console"] = fill(h.console_url or default_ct, vmid=c["vmid"], node=node,
+            default = default_vm if c.get("type") == "vm" else default_ct
+            c["console"] = fill(h.console_url or default, vmid=c["vmid"], node=node,
                                 name=c["name"], address=h.address, host=name)
             j = active_job(name, c["vmid"])
             c["job"] = j.public() if j else None
@@ -1164,6 +1236,19 @@ async def api_settings():
 @app.post("/api/settings")
 async def api_settings_save(request: Request):
     b = await _body(request)
+    with config_edit():
+        renames = apply_settings(b)
+    if renames:  # keep queued updates pointing at renamed windows
+        for it in STATE["scheduled"]:
+            if it.get("window") in renames:
+                it["window"] = renames[it["window"]]
+        save_state()
+    return settings_payload()
+
+
+def apply_settings(b):
+    """Apply a settings request to RAW (not saved here). Returns maintenance-window renames."""
+    renames = {}
     if "schedule" in b:
         sc = b["schedule"]
         times = sorted({str(t).strip() for t in sc.get("check_times", [])})
@@ -1202,33 +1287,32 @@ async def api_settings_save(request: Request):
         RAW["snapshots"] = {"enabled": bool(sn.get("enabled", True)), "keep": keep,
                             "on_failure": sn.get("on_failure", "abort")}
     if "windows" in b:
-        old_names = {w["name"] for w in WINDOWS}
         windows = [{"name": str(w.get("name", "")).strip(), "days": w.get("days", []),
                     "start": str(w.get("start", "")), "end": str(w.get("end", ""))} for w in b["windows"]]
         renames = {str(w.get("was")): str(w.get("name", "")).strip() for w in b["windows"]
                    if w.get("was") and w.get("was") != w.get("name")}
         RAW["maintenance"] = {"windows": windows}
         RAW.pop("maintenance_only", None)
-        # keep schedules and queued updates pointing at renamed windows
-        scheds = RAW.get("schedules") or dict(SCHEDULES)
+        # keep schedules pointing at renamed windows
+        scheds = copy.deepcopy(RAW.get("schedules") or SCHEDULES)
         for pol in scheds.values():
             if pol and pol.get("window") in renames:
                 pol["window"] = renames[pol["window"]]
         RAW["schedules"] = scheds
-        for it in STATE["scheduled"]:
-            if it.get("window") in renames:
-                it["window"] = renames[it["window"]]
-        if old_names:
-            save_state()
     if "schedules" in b:
-        scheds = {}
+        # Merge: only the targets sent are changed (null removes one). Targets the page didn't
+        # list, such as a stack whose guest was unreachable at the last check, keep theirs.
         names = {str(w.get("name")) for w in (RAW.get("maintenance") or {}).get("windows", [])} \
             if "windows" in b else {w["name"] for w in WINDOWS}
+        scheds = copy.deepcopy(RAW.get("schedules") or SCHEDULES)
         for key, pol in (b["schedules"] or {}).items():
             if pol and pol.get("window") in names:
                 scheds[str(key)] = {"window": pol["window"], "auto": bool(pol.get("auto")),
                                     "reboot": bool(pol.get("reboot"))}
-        RAW["schedules"] = scheds
+            else:
+                scheds.pop(str(key), None)
+        hosts = {h.get("name") for h in RAW.get("hosts") or []}
+        RAW["schedules"] = {k: v for k, v in scheds.items() if k.rpartition("/")[0] in hosts}
         RAW.pop("maintenance_only", None)
     if "windows_updates" in b:
         RAW["windows_updates"] = {"drivers": bool(b["windows_updates"].get("drivers"))}
@@ -1263,11 +1347,7 @@ async def api_settings_save(request: Request):
             RAW["exclude"] = sorted({int(v) for v in b["exclude"]})
         except (TypeError, ValueError):
             bad("Excluded IDs must be numbers")
-    try:
-        save_config()
-    except (ValueError, SystemExit) as e:
-        bad(str(e))
-    return settings_payload()
+    return renames
 
 
 @app.post("/api/settings/registry-test")
@@ -1312,36 +1392,45 @@ async def api_host_save(request: Request):
     kind = b.get("type") or "pve"
     if kind not in HOST_KINDS:
         bad("Unknown host type")
-    hosts = RAW.setdefault("hosts", []) or []
-    RAW["hosts"] = hosts
     original = b.get("original")
-    if original:
-        entry = next((h for h in hosts if h.get("name") == original), None)
-        if entry is None:
-            raise HTTPException(404, "Unknown host")
-        if host_busy(original):
-            raise HTTPException(409, "This host has a check or update running")
-        if name != original and any(h.get("name") == name for h in hosts):
-            raise HTTPException(409, "A host with that name already exists")
-        entry.update(name=name, address=address)
-        if kind == "pve":
-            entry.pop("type", None)
+    renamed = bool(original) and name != original
+    if original and host_busy(original):
+        raise HTTPException(409, "This host has a check or update running")
+    with config_edit():
+        hosts = RAW.get("hosts") or []
+        RAW["hosts"] = hosts
+        if original:
+            entry = next((h for h in hosts if h.get("name") == original), None)
+            if entry is None:
+                raise HTTPException(404, "Unknown host")
+            if renamed and any(h.get("name") == name for h in hosts):
+                raise HTTPException(409, "A host with that name already exists")
+            entry.update(name=name, address=address)
+            if kind == "pve":
+                entry.pop("type", None)
+            else:
+                entry["type"] = kind
+            if port == 22:
+                entry.pop("port", None)
+            else:
+                entry["port"] = port
+            if renamed:  # carry its maintenance schedules over to the new name
+                RAW["schedules"] = {(name + k[len(original):] if k.startswith(original + "/") else k): v
+                                    for k, v in copy.deepcopy(RAW.get("schedules") or SCHEDULES).items()}
         else:
-            entry["type"] = kind
-        if port == 22:
-            entry.pop("port", None)
-        else:
-            entry["port"] = port
-        if name != original:
-            STATE["hosts"].pop(original, None)
-            STATE["scheduled"] = [i for i in STATE["scheduled"] if i["host"] != original]
-            save_state()
-    else:
-        if any(h.get("name") == name for h in hosts):
-            raise HTTPException(409, "A host with that name already exists")
-        hosts.append({"name": name, "address": address, **({"port": port} if port != 22 else {}),
-                      **({"type": kind} if kind != "pve" else {})})
-    save_config()
+            if any(h.get("name") == name for h in hosts):
+                raise HTTPException(409, "A host with that name already exists")
+            hosts.append({"name": name, "address": address, **({"port": port} if port != 22 else {}),
+                          **({"type": kind} if kind != "pve" else {})})
+    if renamed:  # ...and its last check results and queued updates
+        if original in STATE["hosts"]:
+            STATE["hosts"][name] = STATE["hosts"].pop(original)
+        for it in STATE["scheduled"]:
+            if it["host"] == original:
+                it["host"] = name
+                it["name"] = target_name(name, it["vmid"], it.get("stack"))
+        save_state()
+        MAINT_CHANGED.set()
     return settings_payload()
 
 
@@ -1351,13 +1440,13 @@ async def api_host_delete(request: Request):
     h = get_host(b)
     if host_busy(h.name):
         raise HTTPException(409, "This host has a check or update running")
-    RAW["hosts"] = [x for x in RAW.get("hosts") or [] if x.get("name") != h.name]
+    with config_edit():
+        RAW["hosts"] = [x for x in RAW.get("hosts") or [] if x.get("name") != h.name]
+        RAW["schedules"] = {k: v for k, v in copy.deepcopy(RAW.get("schedules") or SCHEDULES).items()
+                            if not k.startswith(h.name + "/")}
     STATE["hosts"].pop(h.name, None)
     STATE["scheduled"] = [i for i in STATE["scheduled"] if i["host"] != h.name]
-    RAW["schedules"] = {k: v for k, v in (RAW.get("schedules") or SCHEDULES).items()
-                        if not k.startswith(h.name + "/")}
     save_state()
-    save_config()
     return settings_payload()
 
 
