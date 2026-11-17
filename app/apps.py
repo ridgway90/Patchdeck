@@ -57,6 +57,43 @@ ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07")
 SPINNER = re.compile(r"^[⠀-⣿]\s*")
 
 
+# ---------- scripts whose update is only an apt upgrade
+
+UPDATE_FN = re.compile(r"\bupdate_script\s*\(\)\s*\{")
+# The only things such a script may do. Anything else (a version check, a download, a service
+# restart, an app's own updater) means the app has its own update and keeps its row.
+APT_LINE_OK = [re.compile(p) for p in (
+    r"^(header_info|check_container_storage|check_container_resources|exit|fi|else|\})$",
+    r"^msg_(info|ok|error|warn)\b.*$",
+    r"^(\$STD\s+)?apt_update_safe$",
+    r"^(\$STD\s+)?(apt|apt-get)\s+.+$",
+    r"^if\s+\[\[.*\]\];?\s*then$",  # "is it installed?" guards
+)]
+APT_UPGRADES = re.compile(r"apt_update_safe|\bapt(?:-get)?\s+.*\b(upgrade|dist-upgrade|install)\b")
+
+
+def update_body(text):
+    m = UPDATE_FN.search(text)
+    if not m:
+        return None
+    rest = text[m.end():]
+    end = re.search(r"^\}\s*$", rest, re.M)  # the function closes with a } at the start of a line
+    return rest[:end.start()] if end else rest
+
+
+def apt_only(text):
+    """True when the script's update_script only upgrades packages with apt, which Patchdeck's
+    normal package check already covers."""
+    body = update_body(text)
+    if not body:
+        return False
+    lines = [ln.strip() for ln in body.splitlines()]
+    lines = [ln for ln in lines if ln and not ln.startswith("#")]
+    if not lines or not any(APT_UPGRADES.search(ln) for ln in lines):
+        return False
+    return all(any(rx.match(ln) for rx in APT_LINE_OK) for ln in lines)
+
+
 # ---------- reading what's inside the container
 
 def parse_detect(out):
@@ -224,6 +261,10 @@ async def _annotate_one(client, app, token):
         app["note"] = why
         return
     comps = parse_components(text)
+    if not comps and apt_only(text):
+        app["status"] = "os"  # nothing beyond the OS package check; the dashboard hides it
+        app["note"] = "this app updates through apt, which the package check already covers"
+        return
     if not comps:
         app["note"] = ("this app's script doesn't check GitHub releases, so Patchdeck can't tell whether "
                        "it has an update; run its update to find out")
