@@ -19,9 +19,9 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import sshsetup
+from . import apps, registry, sshsetup
+from .apps import APP
 from .notify import discord
-from . import registry
 from .proxmox import APK_UPGRADE, APT_UPGRADE, HOST_KINDS, Host, family, stack_update_script
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -110,6 +110,10 @@ def effective(raw):
     cfg["windows_updates"] = {"drivers": bool(wn.get("drivers", False))}
     cfg["docker"] = {"enabled": bool(dk.get("enabled", True)), "prune": bool(dk.get("prune", True)),
                      "logins": logins}
+    ap = cfg.get("apps") if isinstance(cfg.get("apps"), dict) else {}
+    env_token = os.environ.get("PATCHDECK_GITHUB_TOKEN") or ""
+    cfg["apps"] = {"enabled": bool(ap.get("enabled", True)), "token": env_token or str(ap.get("github_token") or ""),
+                   "token_from_env": bool(env_token)}
     cfg["maintenance"], cfg["schedules"] = normalise_maintenance(cfg)
     hosts = []
     for h in cfg.get("hosts") or []:
@@ -141,7 +145,7 @@ MAINT_CHANGED = asyncio.Event()
 
 def apply_config():
     """Rebuild everything derived from CFG."""
-    global SSH, KNOWN_HOSTS, KEY_FILE, HOSTS, SNAP, EXCLUDE, DISCORD, WINDOWS, SCHEDULES, DOCKER
+    global SSH, KNOWN_HOSTS, KEY_FILE, HOSTS, SNAP, EXCLUDE, DISCORD, WINDOWS, SCHEDULES, DOCKER, APPS
     SSH = CFG["ssh"]
     kh = SSH.get("known_hosts", str(DATA_DIR / "known_hosts"))
     KNOWN_HOSTS = None if kh in ("none", "off", False) else kh
@@ -167,6 +171,7 @@ def apply_config():
     EXCLUDE = {int(v) for v in CFG["exclude"]}
     DISCORD = CFG["discord"]
     DOCKER = CFG["docker"]
+    APPS = CFG["apps"]
     WINDOWS = CFG["maintenance"]["windows"]
     SCHEDULES = CFG["schedules"]
 
@@ -336,7 +341,10 @@ def find_target(host, vmid):
 
 
 def find_stack(host, vmid, stack):
+    """A Docker stack of a target, or (for the reserved name APP) its community-scripts app."""
     t = find_target(host, vmid) or {}
+    if stack == APP:
+        return t.get("app")
     return next((st for st in t.get("stacks") or [] if st["name"] == stack), None)
 
 
@@ -346,7 +354,20 @@ def target_kind(host, vmid):
 
 def target_name(host, vmid, stack=None):
     base = f"{host} (host)" if vmid is None else (find_ct(host, vmid) or {}).get("name", str(vmid))
+    if stack == APP:
+        return f"{base} / app"
     return f"{base} / {stack}" if stack else base
+
+
+async def annotate_apps(entries):
+    """Work out which community-scripts apps have a newer version."""
+    if APPS["enabled"]:
+        await apps.annotate([e for e in entries if e], token=APPS["token"])
+
+
+async def annotate_extras(entry):
+    await annotate_docker([entry])
+    await annotate_apps([entry])
 
 
 async def annotate_docker(entries):
@@ -377,6 +398,9 @@ async def run_check(job):
             if DOCKER["enabled"]:
                 job.log("Checking Docker images against their registries…")
                 await annotate_docker([result["host"]] + result["containers"])
+            if APPS["enabled"] and any(c.get("app") for c in result["containers"]):
+                job.log("Checking community-scripts apps against GitHub…")
+                await annotate_apps(result["containers"])
             STATE["hosts"][job.host] = result
             save_state()
             n_ct = sum(len(c["packages"]) for c in result["containers"])
@@ -386,6 +410,11 @@ async def run_check(job):
                 job.log(f"  {c['vmid']:>5}  {c['name']:<24} {detail}")
                 for st in c.get("stacks") or []:
                     job.log(f"         🐳 {st['name']:<21} {st.get('updates', 0)} image update(s)")
+                a = c.get("app")
+                if a:
+                    job.log(f"         🧩 {(a.get('name') or 'app'):<21} " + (
+                        f"{a['updates']} app update(s)" if a.get("status") == "update"
+                        else "current" if a.get("status") == "current" else "can't check"))
             job.finish("success", f"host {len(result['host']['packages'])} · containers {n_ct} updates")
         except Exception as e:
             prev = STATE["hosts"].get(job.host, {})
@@ -434,25 +463,47 @@ def pending_stacks():
     return out
 
 
+def pending_apps():
+    """(host, vmid, app) for every running container whose community-scripts app has an update."""
+    out = []
+    for hname in HOSTS:
+        h = STATE["hosts"].get(hname) or {}
+        for c in h.get("containers", []):
+            a = c.get("app")
+            if a and a.get("updates") and c["vmid"] not in EXCLUDE and c.get("status") == "running":
+                out.append((hname, c["vmid"], a))
+    return out
+
+
+def app_summary(a):
+    return ", ".join(f"{x['app']} {x['installed']} → {x['latest']}" for x in a.get("components", [])
+                     if x.get("status") == "update")
+
+
 async def notify_check():
     mode = DISCORD.get("on_check", "always")
     if mode == "off" or not DISCORD.get("webhook"):
         return
     targets = pending_targets()
     stacks = pending_stacks() if DOCKER["enabled"] else []
+    app_list = pending_apps() if APPS["enabled"] else []
     sig = sorted(f"{h}:{v}:{p['name']}:{p['to']}" for h, v, _, pk in targets for p in pk)
     sig += sorted(f"{h}:{v}:{st}:{i['ref']}:{i.get('remote')}" for h, v, st, _, _ in stacks
                   for i in (find_stack(h, v, st) or {}).get("images", []) if i.get("status") == "update")
-    if not (targets or stacks) or (mode == "new" and set(sig) <= set(STATE["notified"])):
+    sig += sorted(f"{h}:{v}:app:{x['app']}:{x['latest']}" for h, v, a in app_list
+                  for x in a["components"] if x.get("status") == "update")
+    if not (targets or stacks or app_list) or (mode == "new" and set(sig) <= set(STATE["notified"])):
         return
     total = sum(len(pk) for *_, pk in targets)
     lines = [f"🔔 **{total} updates available** across {len(targets)} target(s)" if targets
-             else "🔔 **Docker image updates available**"]
+             else "🔔 **Docker and app updates available**"]
     for h, vmid, name, pk in targets:
         where = f"`{h}`" if vmid is None else f"`{h}/{vmid}`"
         lines.append(f"• **{name}** {where}: {len(pk)}")
     for h, vmid, st, name, n in stacks:
         lines.append(f"🐳 **{name}** `{h}`: {n} image{'s' if n != 1 else ''}")
+    for h, vmid, a in app_list:
+        lines.append(f"🧩 **{target_name(h, vmid)}** `{h}`: {app_summary(a)}")
     errors = [f"{n}/{c['name']}" for n, h in STATE["hosts"].items()
               for c in h.get("containers", [])
               if c.get("error") and not c.get("unsupported") and c["vmid"] not in EXCLUDE]
@@ -497,6 +548,54 @@ async def refresh_docker(host, vmid):
         save_state()
 
 
+async def refresh_app(host, vmid):
+    d = await HOSTS[host].check_app(vmid)
+    await annotate_apps([d])
+    target = find_target(host, vmid)
+    if target is not None:
+        target["app"] = d.get("app")
+        save_state()
+
+
+async def run_app_update(job):
+    """Run a container's own community-scripts `update` command."""
+    h = HOSTS[job.host]
+    async with HOST_LOCKS[job.host]:
+        job.start()
+        try:
+            app = find_stack(job.host, job.vmid, APP)
+            if not app:
+                raise RuntimeError("App not in the last check; run a check first")
+            before = app.get("updates", 0)
+            if job.snapshot:
+                await take_snapshot(job, h, "lxc")
+            job.log(f"$ update   (community-scripts: {app.get('name') or 'app'})")
+            rc = await h.run_in("lxc", job.vmid, apps.UPDATE_CMD, apps.clean_output(job.log))
+            if rc == 0 and job.snapshot:
+                await prune_snapshots(job, h, "lxc")
+            job.log("Re-checking…")
+            try:
+                await refresh_app(job.host, job.vmid)
+                after = find_stack(job.host, job.vmid, APP) or {}
+                if after.get("status") == "unknown":
+                    result = "ran the update command · Patchdeck can't verify the result"
+                else:
+                    result = f"{before} → {after.get('updates', 0)} app update(s)"
+            except Exception as e:
+                job.log(f"Re-check failed: {e}")
+                result = "ran the update command · re-check failed, run a check"
+            if rc == 124:
+                job.finish("failed", "timed out after 60 minutes (the script may be waiting for input)")
+            elif rc != 0:
+                job.finish("failed", f"exit code {rc}")
+            else:
+                job.finish("success", result)
+        except Exception as e:
+            job.log(f"ERROR: {e}")
+            job.finish("failed", str(e))
+    await notify_update(job)
+
+
 async def run_stack_update(job):
     h = HOSTS[job.host]
     async with HOST_LOCKS[job.host]:
@@ -532,6 +631,8 @@ async def run_stack_update(job):
 
 
 async def run_update(job):
+    if job.stack == APP:
+        return await run_app_update(job)
     if job.stack:
         return await run_stack_update(job)
     h = HOSTS[job.host]
@@ -612,9 +713,15 @@ async def run_update(job):
 async def recheck(job):
     h = HOSTS[job.host]
     if job.vmid is None:
-        STATE["hosts"][job.host]["host"] = after = await h.check_self()
+        after = await h.check_self()
+        if h.kind == "debian":  # check_self doesn't look at Docker, so keep that part current too
+            d = await h.check_docker("host", None)
+            after["stacks"], after["docker_error"] = d.get("stacks"), d.get("docker_error")
+            await annotate_docker([after])
+        STATE["hosts"][job.host]["host"] = after
     else:
         after = await h.check_guest(job.vmid)
+        await annotate_extras(after)  # a fresh check has no Docker/app verdicts until they're looked up
         cts = STATE["hosts"][job.host]["containers"]
         cts[:] = [after if c["vmid"] == job.vmid else c for c in cts]
     save_state()
@@ -1002,6 +1109,7 @@ def build_state():
             c["schedule"] = SCHEDULES.get(target_key(name, c["vmid"]))
             c.setdefault("type", "lxc")
             c["stacks"] = deco_stacks(name, c["vmid"], c.get("stacks"))
+            c["app"] = deco_app(name, c["vmid"], c.get("app"))
             containers.append(c)
         hj = active_job(name, None)
         hosts.append({
@@ -1034,6 +1142,14 @@ def deco_stacks(host, vmid, stacks):
                     "scheduled": sched_public(host, vmid, st["name"]),
                     "schedule": SCHEDULES.get(target_key(host, vmid, st["name"]))})
     return out
+
+
+def deco_app(host, vmid, app):
+    if not app or not APPS["enabled"]:
+        return None
+    j = active_job(host, vmid, APP)
+    return {**app, "job": j.public() if j else None, "scheduled": sched_public(host, vmid, APP),
+            "schedule": SCHEDULES.get(target_key(host, vmid, APP))}
 
 
 def sched_public(host, vmid, stack=None):
@@ -1096,6 +1212,8 @@ async def api_update_all(request: Request):
     targets = [(h, v, None) for h, v, _, _ in pending_targets()]
     if body.get("include_docker") and DOCKER["enabled"]:
         targets += [(h, v, st) for h, v, st, _, _ in pending_stacks()]
+    if body.get("include_docker") and APPS["enabled"]:
+        targets += [(h, v, APP) for h, v, _ in pending_apps()]
     for host, vmid, stack in targets:
         if vmid is None and not body.get("include_hosts"):
             continue
@@ -1209,6 +1327,7 @@ def settings_payload():
                     "on_update": bool(DISCORD.get("on_update", True))},
         "snapshots": SNAP,
         "windows_updates": CFG["windows_updates"],
+        "apps": {"enabled": APPS["enabled"], "token_set": bool(APPS["token"]), "from_env": APPS["token_from_env"]},
         "docker": {"enabled": DOCKER["enabled"], "prune": DOCKER["prune"],
                    "logins": [{"registry": lg["registry"], "username": lg["username"],
                                "token_set": bool(lg["token"]), "from_env": bool(lg.get("env"))}
@@ -1219,7 +1338,7 @@ def settings_payload():
                      "stacks": [st["name"] for st in (STATE["hosts"].get(n, {}).get("host") or {}).get("stacks") or []],
                      "containers": [
             {"vmid": c["vmid"], "name": c["name"], "type": c.get("type", "lxc"),
-             "stacks": [st["name"] for st in c.get("stacks") or []]}
+             "stacks": [st["name"] for st in c.get("stacks") or []], "app": bool(c.get("app"))}
             for c in STATE["hosts"].get(n, {}).get("containers", []) if c["vmid"] not in EXCLUDE]}
             for n, h in HOSTS.items()],
         "host_kinds": HOST_KINDS,
@@ -1314,6 +1433,15 @@ def apply_settings(b):
         hosts = {h.get("name") for h in RAW.get("hosts") or []}
         RAW["schedules"] = {k: v for k, v in scheds.items() if k.rpartition("/")[0] in hosts}
         RAW.pop("maintenance_only", None)
+    if "apps" in b:
+        a = b["apps"]
+        raw = RAW.get("apps") if isinstance(RAW.get("apps"), dict) else {}
+        new = {"enabled": bool(a.get("enabled", raw.get("enabled", True))), "github_token": raw.get("github_token") or ""}
+        if a.get("clear_token"):
+            new["github_token"] = ""
+        elif str(a.get("github_token") or "").strip():  # a blank field keeps the saved token
+            new["github_token"] = str(a["github_token"]).strip()
+        RAW["apps"] = new
     if "windows_updates" in b:
         RAW["windows_updates"] = {"drivers": bool(b["windows_updates"].get("drivers"))}
     if "docker" in b:
@@ -1348,6 +1476,14 @@ def apply_settings(b):
         except (TypeError, ValueError):
             bad("Excluded IDs must be numbers")
     return renames
+
+
+@app.post("/api/settings/github-test")
+async def api_github_test(request: Request):
+    b = await _body(request)
+    token = str(b.get("token") or "").strip() or APPS["token"]
+    ok, msg = await apps.test_token(token)
+    return {"ok": ok, "message": msg}
 
 
 @app.post("/api/settings/registry-test")

@@ -19,6 +19,8 @@ A small, self-hosted update dashboard for Proxmox VE hosts and their LXC contain
 - **Docker Compose stacks** inside containers, VMs and Debian/Ubuntu servers: Patchdeck asks each
   image's registry (Docker Hub, GHCR, lscr.io, Quay…) whether a newer version exists, without
   pulling anything, and updates a stack with `docker compose pull && up -d`, now or in a window
+- **community-scripts apps**: containers made with the community-scripts have an `update` command that
+  updates the app itself (Seerr, Jellyfin, …); Patchdeck shows when one has a new version and runs it
 - **Proxmox Backup Server** and plain Debian/Ubuntu servers can be added as hosts too
 - Debian, Ubuntu, Devuan and Alpine guests, and **Windows VMs** (Windows Update through the guest agent)
 
@@ -96,6 +98,29 @@ Windows Update service, driven through the QEMU guest agent; nothing else is ins
   "working on updates" and the guest agent to come back.
 - Windows keeps its own automatic update schedule; Patchdeck checks and updates alongside it.
   Snapshots, maintenance windows and auto-update work as for Linux guests.
+
+## community-scripts apps
+
+Containers created with the [community-scripts](https://community-scripts.org) get an `update`
+command that updates the application itself, which is separate from the operating system's packages.
+A 🧩 row under such a container shows its state:
+
+- Patchdeck reads the version the script recorded in the container (`/root/.<app>`), finds the app's
+  GitHub repository from the app's public script in the community-scripts repository (read as text,
+  never run), and compares it with the latest GitHub release, which is what the script itself does.
+- **App update** (or **Run update…** when Patchdeck can't tell) runs the container's own
+  `update` command, streams its output, and re-checks afterwards. Snapshots, maintenance windows and
+  auto-update work as for the rest; it gives up after 60 minutes in case the script waits for input.
+- **Can't check** means this app's script doesn't use GitHub releases, pins a version, or its script
+  couldn't be read. The update can still be run by hand from the 🧩 row.
+- Patchdeck needs outbound HTTPS to `raw.githubusercontent.com` and `api.github.com`. GitHub allows
+  60 anonymous lookups an hour per IP; results are cached, but a token (no permissions needed) in
+  Settings → App updates raises that to 5,000. It can also be set with `PATCHDECK_GITHUB_TOKEN`.
+- Turn the whole thing off under Settings → App updates.
+
+This follows the community-scripts' own conventions, which change from time to time; if an app that
+should be detected shows "Can't check", please open an issue with the output of
+`pct exec <id> -- sh -c 'head -n 20 /usr/bin/update; ls -la /root'`.
 
 ## Docker stacks
 
