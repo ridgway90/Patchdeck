@@ -211,12 +211,12 @@ function schedulesSection() {
   if (!S.windows.length) return `<p class="muted">Add and save a maintenance window first.</p>`;
   const opts = (cur) => `<option value="">No schedule</option>` + S.windows.map((w) =>
     `<option value="${esc(w.name)}" ${cur === w.name ? "selected" : ""}>${esc(w.name)}</option>`).join("");
-  const row = (key, label, isStack) => {
+  const row = (key, label, isStack, noAuto) => {
     const p = S.schedules[key] || {};
     return `<tr data-key="${esc(key)}">
       <td>${label}</td>
       <td><select data-sf="window" aria-label="Window for ${esc(key)}">${opts(p.window)}</select></td>
-      <td class="c"><input type="checkbox" data-sf="auto" ${p.auto ? "checked" : ""} aria-label="Auto-update"></td>
+      <td class="c"><input type="checkbox" data-sf="auto" ${p.auto && !noAuto ? "checked" : ""} ${noAuto ? 'disabled title="Patchdeck can\'t tell when this app has an update, so it can\'t update it automatically. Run it from the dashboard."' : ""} aria-label="Auto-update"></td>
       <td class="c">${isStack ? "" : `<input type="checkbox" data-sf="reboot" ${p.reboot ? "checked" : ""} aria-label="Reboot if needed">`}</td>
     </tr>`;
   };
@@ -226,7 +226,7 @@ function schedulesSection() {
     ${(t.stacks || []).map((st) => row(`${t.host}/host:${st}`, `<span class="indent">🐳 ${esc(st)}</span>`, true)).join("")}
     ${t.containers.map((c) => row(`${t.host}/${c.vmid}`, `${esc(c.name)} <span class="vmid">${c.vmid}</span>${c.type === "vm" ? ' <span class="kind-tag">VM</span>' : ""}`)
       + (c.stacks || []).map((st) => row(`${t.host}/${c.vmid}:${st}`, `<span class="indent">🐳 ${esc(st)}</span>`, true)).join("")
-      + (c.app ? row(`${t.host}/${c.vmid}:@app`, `<span class="indent">🧩 app update</span>`, true) : "")).join("")}`).join("");
+      + (c.app ? row(`${t.host}/${c.vmid}:@app`, `<span class="indent">🧩 app update</span>`, true, c.app_manual) : "")).join("")}`).join("");
   return `
     <p>Give a container, VM, host, Docker stack (🐳) or community-scripts app (🧩) a window. Its Update dialog then defaults to that window, and Update all queues it there.
       Tick <strong>Auto</strong> to have it checked and updated in its window without you clicking anything.</p>
@@ -283,6 +283,7 @@ function appsSection() {
       <p class="hint">Containers created with the community-scripts have an <code>update</code> command that updates the app itself (Seerr, Jellyfin, …), separate from the operating system.
         Patchdeck reads the version it recorded in the container, compares it with the app's latest GitHub release, and can run that command for you.
         GitHub allows 60 anonymous lookups an hour per IP address; a token (no permissions needed) raises that to 5,000.</p>
+      <label class="check"><input type="checkbox" name="show_manual" ${a.show_manual ? "checked" : ""}> <span>Also list apps that have to be updated by hand (their script has no version check, for example AdGuard Home on Alpine), with a Run update button</span></label>
       <label class="field"><span>GitHub token (optional)</span>
         <input name="token" type="password" autocomplete="new-password" placeholder="${a.token_set ? "Saved. Leave blank to keep it" : "Personal access token"}" ${a.from_env ? "disabled" : ""}></label>
       ${a.from_env ? `<p class="hint">Set by the PATCHDECK_GITHUB_TOKEN environment variable.</p>` : ""}
@@ -578,7 +579,7 @@ $("#view-settings").addEventListener("submit", async (e) => {
       break;
     }
     case "apps": {
-      const body = { enabled: f.elements.enabled.checked };
+      const body = { enabled: f.elements.enabled.checked, show_manual: f.elements.show_manual.checked };
       if (v("token")) body.github_token = v("token").trim();
       const r = await act(btn, "/api/settings", { apps: body }, "Saving…");
       if (r) { toast("App update settings saved"); applySettings(r, ["apps"]); refresh(); }

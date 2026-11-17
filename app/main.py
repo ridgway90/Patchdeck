@@ -113,7 +113,7 @@ def effective(raw):
     ap = cfg.get("apps") if isinstance(cfg.get("apps"), dict) else {}
     env_token = os.environ.get("PATCHDECK_GITHUB_TOKEN") or ""
     cfg["apps"] = {"enabled": bool(ap.get("enabled", True)), "token": env_token or str(ap.get("github_token") or ""),
-                   "token_from_env": bool(env_token)}
+                   "token_from_env": bool(env_token), "show_manual": bool(ap.get("show_manual", True))}
     cfg["maintenance"], cfg["schedules"] = normalise_maintenance(cfg)
     hosts = []
     for h in cfg.get("hosts") or []:
@@ -413,10 +413,11 @@ async def run_check(job):
                     for p in st.get("problems") or []:
                         job.log(f"            ⚠ {p}")
                 a = c.get("app")
-                if a and a.get("status") != "os":
+                if app_visible(a):
                     job.log(f"         🧩 {(a.get('name') or 'app'):<21} " + (
                         f"{a['updates']} app update(s)" if a.get("status") == "update"
-                        else "current" if a.get("status") == "current" else "can't check"))
+                        else "current" if a.get("status") == "current"
+                        else "update by hand" if a.get("status") == "manual" else "can't check"))
             job.finish("success", f"host {len(result['host']['packages'])} · containers {n_ct} updates")
         except Exception as e:
             prev = STATE["hosts"].get(job.host, {})
@@ -579,7 +580,7 @@ async def run_app_update(job):
             try:
                 await refresh_app(job.host, job.vmid)
                 after = find_stack(job.host, job.vmid, APP) or {}
-                if after.get("status") == "unknown":
+                if after.get("status") in ("unknown", "manual"):
                     result = "ran the update command · Patchdeck can't verify the result"
                 else:
                     result = f"{before} → {after.get('updates', 0)} app update(s)"
@@ -1159,8 +1160,15 @@ def deco_stacks(host, vmid, stacks):
     return out
 
 
-def deco_app(host, vmid, app):
+def app_visible(app):
+    """Plain-OS apps are never shown; apps that can only be updated by hand when the setting says so."""
     if not app or not APPS["enabled"] or app.get("status") == "os":
+        return False
+    return APPS["show_manual"] or app.get("status") != "manual"
+
+
+def deco_app(host, vmid, app):
+    if not app_visible(app):
         return None
     j = active_job(host, vmid, APP)
     return {**app, "job": j.public() if j else None, "scheduled": sched_public(host, vmid, APP),
@@ -1342,7 +1350,8 @@ def settings_payload():
                     "on_update": bool(DISCORD.get("on_update", True))},
         "snapshots": SNAP,
         "windows_updates": CFG["windows_updates"],
-        "apps": {"enabled": APPS["enabled"], "token_set": bool(APPS["token"]), "from_env": APPS["token_from_env"]},
+        "apps": {"enabled": APPS["enabled"], "token_set": bool(APPS["token"]), "from_env": APPS["token_from_env"],
+                 "show_manual": APPS["show_manual"]},
         "docker": {"enabled": DOCKER["enabled"], "prune": DOCKER["prune"], "health_check": DOCKER["health_check"],
                    "health_wait": HEALTH_WAIT,
                    "logins": [{"registry": lg["registry"], "username": lg["username"],
@@ -1354,7 +1363,8 @@ def settings_payload():
                      "stacks": [st["name"] for st in (STATE["hosts"].get(n, {}).get("host") or {}).get("stacks") or []],
                      "containers": [
             {"vmid": c["vmid"], "name": c["name"], "type": c.get("type", "lxc"),
-             "stacks": [st["name"] for st in c.get("stacks") or []], "app": bool(c.get("app")) and c["app"].get("status") != "os"}
+             "stacks": [st["name"] for st in c.get("stacks") or []], "app": app_visible(c.get("app")),
+             "app_manual": (c.get("app") or {}).get("status") in ("manual", "unknown")}
             for c in STATE["hosts"].get(n, {}).get("containers", []) if c["vmid"] not in EXCLUDE]}
             for n, h in HOSTS.items()],
         "host_kinds": HOST_KINDS,
@@ -1452,7 +1462,8 @@ def apply_settings(b):
     if "apps" in b:
         a = b["apps"]
         raw = RAW.get("apps") if isinstance(RAW.get("apps"), dict) else {}
-        new = {"enabled": bool(a.get("enabled", raw.get("enabled", True))), "github_token": raw.get("github_token") or ""}
+        new = {"enabled": bool(a.get("enabled", raw.get("enabled", True))), "github_token": raw.get("github_token") or "",
+               "show_manual": bool(a.get("show_manual", raw.get("show_manual", True)))}
         if a.get("clear_token"):
             new["github_token"] = ""
         elif str(a.get("github_token") or "").strip():  # a blank field keeps the saved token
