@@ -262,6 +262,7 @@ function dockerSection() {
     <form data-form="docker">
       <label class="check"><input type="checkbox" name="enabled" ${d.enabled ? "checked" : ""}> <span>Check Docker Compose stacks for new image versions</span></label>
       <label class="check"><input type="checkbox" name="prune" ${d.prune ? "checked" : ""}> <span>Remove unused old images after updating a stack (<code>docker image prune</code>)</span></label>
+      <label class="check"><input type="checkbox" name="health_check" ${d.health_check ? "checked" : ""}> <span>After updating a stack, watch it for about ${d.health_wait} seconds and report it if its containers keep restarting or exit with an error</span></label>
       <h3>Registry logins</h3>
       <p class="hint">Without a login Docker Hub allows about 100 image lookups an hour per IP address; logging in raises that and lets Patchdeck check private images.
         For Docker Hub, use your username and a <strong>read-only personal access token</strong> (Docker Hub → Account settings → Personal access tokens), not your password.
@@ -587,7 +588,7 @@ $("#view-settings").addEventListener("submit", async (e) => {
       collectLogins();
       const logins = loginDraft.filter((l) => !l.from_env && (l.username || l.token))
         .map((l) => ({ registry: l.registry || "docker.io", username: l.username, token: l.token }));
-      const r = await act(btn, "/api/settings", { docker: { enabled: f.elements.enabled.checked, prune: f.elements.prune.checked, logins } }, "Saving…");
+      const r = await act(btn, "/api/settings", { docker: { enabled: f.elements.enabled.checked, prune: f.elements.prune.checked, health_check: f.elements.health_check.checked, logins } }, "Saving…");
       if (r) { loginDraft = null; toast("Docker settings saved"); applySettings(r, ["docker"]); refresh(); }
       break;
     }

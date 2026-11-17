@@ -22,7 +22,7 @@ from fastapi.staticfiles import StaticFiles
 from . import apps, registry, sshsetup
 from .apps import APP
 from .notify import discord
-from .proxmox import APK_UPGRADE, APT_UPGRADE, HOST_KINDS, Host, family, stack_update_script
+from .proxmox import APK_UPGRADE, APT_UPGRADE, HEALTH_WAIT, HOST_KINDS, Host, family, stack_update_script
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("patchdeck")
@@ -109,7 +109,7 @@ def effective(raw):
     wn = cfg.get("windows_updates") if isinstance(cfg.get("windows_updates"), dict) else {}
     cfg["windows_updates"] = {"drivers": bool(wn.get("drivers", False))}
     cfg["docker"] = {"enabled": bool(dk.get("enabled", True)), "prune": bool(dk.get("prune", True)),
-                     "logins": logins}
+                     "health_check": bool(dk.get("health_check", True)), "logins": logins}
     ap = cfg.get("apps") if isinstance(cfg.get("apps"), dict) else {}
     env_token = os.environ.get("PATCHDECK_GITHUB_TOKEN") or ""
     cfg["apps"] = {"enabled": bool(ap.get("enabled", True)), "token": env_token or str(ap.get("github_token") or ""),
@@ -410,6 +410,8 @@ async def run_check(job):
                 job.log(f"  {c['vmid']:>5}  {c['name']:<24} {detail}")
                 for st in c.get("stacks") or []:
                     job.log(f"         🐳 {st['name']:<21} {st.get('updates', 0)} image update(s)")
+                    for p in st.get("problems") or []:
+                        job.log(f"            ⚠ {p}")
                 a = c.get("app")
                 if a and a.get("status") != "os":
                     job.log(f"         🧩 {(a.get('name') or 'app'):<21} " + (
@@ -612,6 +614,17 @@ async def run_stack_update(job):
             rc = await h.run_in(kind, job.vmid, stack_update_script(st["name"], st["files"], DOCKER["prune"]), job.log)
             if rc == 0 and job.snapshot and kind != "host":
                 await prune_snapshots(job, h, kind)
+            problems = []
+            if rc == 0 and DOCKER["health_check"]:
+                job.log(f"Watching the stack for {HEALTH_WAIT} s to check it started properly…")
+                try:
+                    problems = (await h.stack_health(kind, job.vmid, [st])).get(st["name"], [])
+                    for p in problems:
+                        job.log(f"⚠ {p}")
+                    if not problems:
+                        job.log("The stack looks healthy.")
+                except Exception as e:
+                    job.log(f"Couldn't check the stack's health: {e}")
             job.log("Re-checking images…")
             try:
                 await refresh_docker(job.host, job.vmid)
@@ -622,6 +635,8 @@ async def run_stack_update(job):
                 result = "updated · re-check failed, run a check"
             if rc != 0:
                 job.finish("failed", f"exit code {rc}")
+            elif problems:
+                job.finish("warning", f"updated, but the stack is not healthy: {'; '.join(problems)}")
             else:
                 job.finish("success", result)
         except Exception as e:
@@ -745,7 +760,7 @@ async def notify_update(job):
         group = [j for j in JOBS.values() if j.batch == job.batch]
         if any(j.status in ("queued", "running") for j in group):
             return  # the last job in the batch sends the summary
-    icon = {"success": "✅", "failed": "❌"}
+    icon = {"success": "✅", "failed": "❌", "warning": "⚠️"}
     lines = ["🛠️ **Update run finished**" if len(group) > 1 else ""]
     for j in group:
         lines.append(f"{icon.get(j.status, '•')} **{j.name}** `{j.host}`: {j.summary}")
@@ -971,7 +986,7 @@ async def run_maintenance(w, end):
 
     left = [x for x in STATE["scheduled"] if any(x is i for i in items)]
     if DISCORD.get("webhook") and (done or left):
-        icon = {"success": "✅", "failed": "❌"}
+        icon = {"success": "✅", "failed": "❌", "warning": "⚠️"}
         lines = [f"🌙 **{w['name']}** maintenance window finished"]
         lines += [f"{icon.get(j.status, '•')} **{j.name}** `{j.host}`: {j.summary}" for j in done]
         if skipped:
@@ -1328,7 +1343,8 @@ def settings_payload():
         "snapshots": SNAP,
         "windows_updates": CFG["windows_updates"],
         "apps": {"enabled": APPS["enabled"], "token_set": bool(APPS["token"]), "from_env": APPS["token_from_env"]},
-        "docker": {"enabled": DOCKER["enabled"], "prune": DOCKER["prune"],
+        "docker": {"enabled": DOCKER["enabled"], "prune": DOCKER["prune"], "health_check": DOCKER["health_check"],
+                   "health_wait": HEALTH_WAIT,
                    "logins": [{"registry": lg["registry"], "username": lg["username"],
                                "token_set": bool(lg["token"]), "from_env": bool(lg.get("env"))}
                               for lg in DOCKER["logins"]]},
@@ -1449,6 +1465,7 @@ def apply_settings(b):
         raw = RAW.get("docker") if isinstance(RAW.get("docker"), dict) else {}
         new = {"enabled": bool(d.get("enabled", raw.get("enabled", True))),
                "prune": bool(d.get("prune", raw.get("prune", True))),
+               "health_check": bool(d.get("health_check", raw.get("health_check", True))),
                "logins": raw.get("logins") or []}
         if "logins" in d:
             # Tokens are never sent to the browser: an empty token keeps the saved one.

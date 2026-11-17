@@ -44,6 +44,7 @@ APT_LINE = re.compile(r"^(\S+?)/\S+\s+(\S+)\s+\S+\s+\[upgradable from: ([^\]]+)\
 APK_LINE = re.compile(r"^(\S+)-(\d[^\s-]*(?:-r\d+)?)\s+<\s+(\S+)")
 SNAP_NAME = re.compile(r"(pre-update-\d{8}-\d{6})")
 RC_MARK = "__PATCHDECK_RC__"
+HEALTH_WAIT = int(os.environ.get("PATCHDECK_HEALTH_WAIT", "20"))  # seconds to watch a stack after updating it
 
 
 DOCKER_ENV = 'export HOME="${HOME:-/root}"; '
@@ -67,16 +68,123 @@ def images_script(stacks):
             f"echo {shlex.quote('__STACK__ ' + st['name'])}; "
             f"docker compose {compose_args(st['name'], st['files'])} config --images 2>/dev/null | sort -u | "
             "while read -r img; do echo \"__IMG__ $img\"; "
-            "docker image inspect --format '{{json .RepoDigests}}' \"$img\" 2>/dev/null || echo __MISSING__; done")
+            "docker image inspect --format '{{json .RepoDigests}}' \"$img\" 2>/dev/null || echo __MISSING__; done; "
+            f"echo __PS__; docker compose {compose_args(st['name'], st['files'])} ps -a --format json 2>/dev/null; "
+            "echo __ENDPS__")
     return DOCKER_ENV + "; ".join(parts)
+
+
+def stack_problems(containers):
+    """What is wrong with a stack's containers, as short sentences starting with the service name.
+    A container that exited with code 0 is fine (a one-shot job); one that crashed is not."""
+    out = []
+    for c in containers:
+        svc, state, health, code = c["service"], c["state"], c["health"], c["exit"]
+        if state == "restarting":
+            out.append(f"{svc} is restarting")
+        elif state == "dead":
+            out.append(f"{svc} is dead")
+        elif state == "created":
+            out.append(f"{svc} was created but never started")
+        elif state == "exited" and code != 0:
+            out.append(f"{svc} exited with code {code}")
+        elif health == "unhealthy":
+            out.append(f"{svc} is unhealthy")
+    return out
+
+
+def _int(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return 0
+
+
+def parse_ps(lines):
+    """`docker compose ps --format json` is one object per line, or one array, depending on the version."""
+    containers = []
+    for line in lines:
+        try:
+            data = json.loads(line)
+        except ValueError:
+            continue
+        for c in data if isinstance(data, list) else [data]:
+            if isinstance(c, dict):
+                containers.append({"service": c.get("Service") or c.get("Name") or "container",
+                                   "state": (c.get("State") or "").lower(), "health": (c.get("Health") or "").lower(),
+                                   "exit": _int(c.get("ExitCode"))})
+    return containers, stack_problems(containers)
+
+
+def health_script(stacks, wait):
+    """Note each container's restart count, wait, then read their state again, so a crash loop shows
+    up even if the container happens to be running at the moment we look."""
+    fmt = ('{{index .Config.Labels "com.docker.compose.service"}}|{{.State.Status}}|{{.State.ExitCode}}|'
+           '{{.RestartCount}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}|{{.Id}}')
+
+    def sample():
+        parts = []
+        for st in stacks:
+            ids = f"docker compose {compose_args(st['name'], st['files'])} ps -a -q 2>/dev/null"
+            parts.append(f"echo {shlex.quote('__STACK__ ' + st['name'])}; for id in $({ids}); do "
+                         f"docker inspect --format {shlex.quote('__C__ ' + fmt)} \"$id\" 2>/dev/null; done")
+        return "; ".join(parts)
+    return DOCKER_ENV + f"echo __BEFORE__; {sample()}; sleep {int(wait)}; echo __AFTER__; {sample()}"
+
+
+def parse_health(out, stacks, wait):
+    """{stack name: [problem, ...]} from the two samples of health_script."""
+    before, after, phase, cur = {}, {}, None, None
+    for line in out.splitlines():
+        line = line.strip()
+        if line == "__BEFORE__":
+            phase = before
+        elif line == "__AFTER__":
+            phase = after
+        elif phase is None:
+            continue
+        elif line.startswith("__STACK__ "):
+            cur = line[10:]
+            phase.setdefault(cur, [])
+        elif line.startswith("__C__ ") and cur is not None:
+            f = line[6:].split("|")
+            if len(f) >= 6:
+                phase[cur].append({"service": f[0] or "container", "state": f[1], "exit": _int(f[2]),
+                                   "restarts": _int(f[3]), "health": f[4], "id": f[5]})
+    result = {}
+    for st in stacks:
+        name = st["name"]
+        now = after.get(name, [])
+        if not now:
+            result[name] = ["couldn't list the stack's containers (is Docker running?)"]
+            continue
+        base = {c["id"]: c["restarts"] for c in before.get(name, [])}
+        problems = stack_problems(now)
+        flagged = {p.split(" ", 1)[0] for p in problems}
+        for c in now:
+            delta = c["restarts"] - base.get(c["id"], c["restarts"])
+            if delta >= 1 and c["service"] not in flagged:
+                problems.append(f"{c['service']} restarted {delta} time{'s' if delta != 1 else ''} in {wait} s (crash loop?)")
+        result[name] = problems
+    return result
 
 
 def parse_images(out, stacks):
     by_name = {st["name"]: st for st in stacks}
-    cur, img = None, None
+    cur, img, ps = None, None, None
     for line in out.splitlines():
         line = line.strip()
-        if line.startswith("__STACK__ "):
+        if ps is not None:  # inside a stack's container listing
+            if line == "__ENDPS__":
+                if cur is not None:
+                    cur["containers"], cur["problems"] = parse_ps(ps)
+                ps = None
+            else:
+                ps.append(line)
+            continue
+        if line == "__PS__":
+            ps = []
+        elif line.startswith("__STACK__ "):
             cur, img = by_name.get(line[10:]), None
         elif line.startswith("__IMG__ ") and cur is not None:
             img = {"ref": line[8:], "digests": [], "missing": False}
@@ -188,7 +296,8 @@ class Host:
             return {"stacks": [], "error": "Docker is installed but the Compose plugin isn't (docker compose)"}
         listed = json.loads(out.strip() or "[]")
         stacks = [{"name": st["Name"], "status": st.get("Status", ""),
-                   "files": [f for f in st.get("ConfigFiles", "").split(",") if f], "images": []}
+                   "files": [f for f in st.get("ConfigFiles", "").split(",") if f], "images": [],
+                   "containers": [], "problems": []}
                   for st in listed]
         stacks = [st for st in stacks if st["files"]]
         if stacks:
@@ -219,6 +328,12 @@ class Host:
         async with self._connect() as conn:
             await self._add_app(conn, entry, vmid)
         return entry
+
+    async def stack_health(self, kind, vmid, stacks, wait=HEALTH_WAIT):
+        """Watch some compose stacks for `wait` seconds. Returns {stack name: [problem, ...]}."""
+        async with self._connect() as conn:
+            out = await self._exec(conn, kind, vmid, health_script(stacks, wait), wait + 90)
+        return parse_health(out, stacks, wait)
 
     async def check_docker(self, kind, vmid):
         entry = {}
