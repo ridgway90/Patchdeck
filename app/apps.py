@@ -57,23 +57,24 @@ ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07")
 SPINNER = re.compile(r"^[⠀-⣿]\s*")
 
 
-# ---------- scripts whose update is only an apt upgrade
+# ---------- scripts whose update is only an OS package upgrade
 
-UPDATE_FN = re.compile(r"\bupdate_script\s*\(\)\s*\{")
 # The only things such a script may do. Anything else (a version check, a download, a service
 # restart, an app's own updater) means the app has its own update and keeps its row.
-APT_LINE_OK = [re.compile(p) for p in (
+OS_LINE_OK = [re.compile(p) for p in (
     r"^(header_info|check_container_storage|check_container_resources|exit|fi|else|\})$",
     r"^msg_(info|ok|error|warn)\b.*$",
     r"^(\$STD\s+)?apt_update_safe$",
-    r"^(\$STD\s+)?(apt|apt-get)\s+.+$",
+    r"^(\$STD\s+)?(apt|apt-get|apk)\s+.+$",
     r"^if\s+\[\[.*\]\];?\s*then$",  # "is it installed?" guards
 )]
-APT_UPGRADES = re.compile(r"apt_update_safe|\bapt(?:-get)?\s+.*\b(upgrade|dist-upgrade|install)\b")
+OS_UPGRADES = re.compile(r"apt_update_safe|\bapt(?:-get)?\s+.*\b(upgrade|dist-upgrade|install)\b|\bapk\s+.*\b(upgrade|add)\b")
+# `run_os_update` calls one of the script's own helpers for the container's OS family.
+OS_HELPERS = {"debian": "update_deb_based", "alpine": "update_alpine"}
 
 
-def update_body(text):
-    m = UPDATE_FN.search(text)
+def function_body(text, name):
+    m = re.search(rf"\b{re.escape(name)}\s*\(\)\s*\{{", text)
     if not m:
         return None
     rest = text[m.end():]
@@ -81,17 +82,30 @@ def update_body(text):
     return rest[:end.start()] if end else rest
 
 
-def apt_only(text):
-    """True when the script's update_script only upgrades packages with apt, which Patchdeck's
-    normal package check already covers."""
-    body = update_body(text)
-    if not body:
+def _lines(body):
+    lines = [ln.strip() for ln in (body or "").splitlines()]
+    return [ln for ln in lines if ln and not ln.startswith("#")]
+
+
+def os_only(text, family=None):
+    """True when the script's update only upgrades OS packages with apt or apk, which Patchdeck's
+    normal package check already covers. `family` ("debian" or "alpine") says which helper a
+    run_os_update call would reach in this container."""
+    lines = _lines(function_body(text, "update_script"))
+    if not lines:
         return False
-    lines = [ln.strip() for ln in body.splitlines()]
-    lines = [ln for ln in lines if ln and not ln.startswith("#")]
-    if not lines or not any(APT_UPGRADES.search(ln) for ln in lines):
-        return False
-    return all(any(rx.match(ln) for rx in APT_LINE_OK) for ln in lines)
+    upgrades = False
+    for ln in lines:
+        if ln == "run_os_update":
+            helper = _lines(function_body(text, OS_HELPERS.get(family, "")) if family in OS_HELPERS else None)
+            if not helper or not all(any(rx.match(h) for rx in OS_LINE_OK) for h in helper):
+                return False
+            upgrades = upgrades or any(OS_UPGRADES.search(h) for h in helper)
+        elif any(rx.match(ln) for rx in OS_LINE_OK):
+            upgrades = upgrades or bool(OS_UPGRADES.search(ln))
+        else:
+            return False
+    return upgrades
 
 
 # ---------- reading what's inside the container
@@ -261,9 +275,9 @@ async def _annotate_one(client, app, token):
         app["note"] = why
         return
     comps = parse_components(text)
-    if not comps and apt_only(text):
+    if not comps and os_only(text, app.get("os_family")):
         app["status"] = "os"  # nothing beyond the OS package check; the dashboard hides it
-        app["note"] = "this app updates through apt, which the package check already covers"
+        app["note"] = "this app updates through the OS package manager, which the package check already covers"
         return
     if not comps:
         app["note"] = ("this app's script doesn't check GitHub releases, so Patchdeck can't tell whether "

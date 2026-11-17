@@ -549,7 +549,7 @@ async def refresh_docker(host, vmid):
 
 
 async def refresh_app(host, vmid):
-    d = await HOSTS[host].check_app(vmid)
+    d = await HOSTS[host].check_app(vmid, (find_ct(host, vmid) or {}).get("os"))
     await annotate_apps([d])
     target = find_target(host, vmid)
     if target is not None:

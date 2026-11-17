@@ -207,12 +207,15 @@ class Host:
     async def _add_app(self, conn, entry, vmid):
         """Note the community-scripts app in a container, if it has one (/usr/bin/update)."""
         try:
-            entry["app"] = apps.parse_detect(await self._exec(conn, "lxc", vmid, apps.DETECT, 30))
+            app = apps.parse_detect(await self._exec(conn, "lxc", vmid, apps.DETECT, 30))
+            if app:  # which OS helper a script's run_os_update would reach in this container
+                app["os_family"] = {"apt": "debian", "apk": "alpine"}.get(family(entry.get("os")))
+            entry["app"] = app
         except Exception:
             entry["app"] = None  # not worth failing the whole check over
 
-    async def check_app(self, vmid):
-        entry = {}
+    async def check_app(self, vmid, os=None):
+        entry = {"os": os}
         async with self._connect() as conn:
             await self._add_app(conn, entry, vmid)
         return entry
