@@ -225,9 +225,10 @@ function schedulesSection() {
     ${row(`${t.host}/host`, t.kind === "pve" ? "<em>The Proxmox host itself</em>" : "<em>This server</em>")}
     ${(t.stacks || []).map((st) => row(`${t.host}/host:${st}`, `<span class="indent">🐳 ${esc(st)}</span>`, true)).join("")}
     ${t.containers.map((c) => row(`${t.host}/${c.vmid}`, `${esc(c.name)} <span class="vmid">${c.vmid}</span>${c.type === "vm" ? ' <span class="kind-tag">VM</span>' : ""}`)
-      + (c.stacks || []).map((st) => row(`${t.host}/${c.vmid}:${st}`, `<span class="indent">🐳 ${esc(st)}</span>`, true)).join("")).join("")}`).join("");
+      + (c.stacks || []).map((st) => row(`${t.host}/${c.vmid}:${st}`, `<span class="indent">🐳 ${esc(st)}</span>`, true)).join("")
+      + (c.app ? row(`${t.host}/${c.vmid}:@app`, `<span class="indent">🧩 app update</span>`, true) : "")).join("")}`).join("");
   return `
-    <p>Give a container, VM, host or Docker stack (🐳) a window. Its Update dialog then defaults to that window, and Update all queues it there.
+    <p>Give a container, VM, host, Docker stack (🐳) or community-scripts app (🧩) a window. Its Update dialog then defaults to that window, and Update all queues it there.
       Tick <strong>Auto</strong> to have it checked and updated in its window without you clicking anything.</p>
     <div class="table-wrap"><table class="sched-table">
       <thead><tr><th>Target</th><th>Window</th><th class="c">Auto</th><th class="c">Reboot if needed</th></tr></thead>
@@ -269,6 +270,26 @@ function dockerSection() {
       <div class="form-actions">
         <button type="button" class="btn small" data-act="login-add">+ Add login</button>
         <button class="btn primary small">Save</button>
+      </div>
+    </form>`;
+}
+
+function appsSection() {
+  const a = S.apps;
+  return `
+    <form data-form="apps">
+      <label class="check"><input type="checkbox" name="enabled" ${a.enabled ? "checked" : ""}> <span>Check community-scripts apps for new versions</span></label>
+      <p class="hint">Containers created with the community-scripts have an <code>update</code> command that updates the app itself (Seerr, Jellyfin, …), separate from the operating system.
+        Patchdeck reads the version it recorded in the container, compares it with the app's latest GitHub release, and can run that command for you.
+        GitHub allows 60 anonymous lookups an hour per IP address; a token (no permissions needed) raises that to 5,000.</p>
+      <label class="field"><span>GitHub token (optional)</span>
+        <input name="token" type="password" autocomplete="new-password" placeholder="${a.token_set ? "Saved. Leave blank to keep it" : "Personal access token"}" ${a.from_env ? "disabled" : ""}></label>
+      ${a.from_env ? `<p class="hint">Set by the PATCHDECK_GITHUB_TOKEN environment variable.</p>` : ""}
+      <div class="form-actions">
+        <button class="btn primary small">Save</button>
+        <button type="button" class="btn small" data-act="gh-test">Test</button>
+        ${a.token_set && !a.from_env ? `<button type="button" class="btn small ghost danger" data-act="gh-clear">Remove token</button>` : ""}
+        <span class="login-result" data-result="gh"></span>
       </div>
     </form>`;
 }
@@ -345,6 +366,7 @@ const SECTIONS = [
   ["windows", "Maintenance windows", windowsSection],
   ["schedules", "Maintenance schedules", schedulesSection],
   ["docker", "Docker", dockerSection],
+  ["apps", "App updates", appsSection],
   ["discord", "Discord notifications", discordSection],
   ["snapshots", "Snapshots", snapshotSection],
   ["general", "General", generalSection],
@@ -434,6 +456,17 @@ $("#view-settings").addEventListener("click", async (e) => {
       if (!confirm(`Remove ${host} from Patchdeck? Its containers will disappear from the dashboard. Nothing changes on the host.`)) return;
       applySettings(await act(b, "/api/hosts/delete", { name: host }, "Removing…"), ["hosts", "schedule", "schedules"]);
       refresh();
+      break;
+    case "gh-test": {
+      const out = document.querySelector('#s-apps [data-result="gh"]');
+      out.textContent = "";
+      const r = await act(b, "/api/settings/github-test", { token: document.querySelector('#s-apps input[name="token"]').value }, "Testing…");
+      if (r) { out.textContent = (r.ok ? "✓ " : "✗ ") + r.message; out.className = `login-result ${r.ok ? "ok-text" : "bad-text"}`; }
+      break;
+    }
+    case "gh-clear":
+      if (!confirm("Remove the saved GitHub token?")) return;
+      applySettings(await act(b, "/api/settings", { apps: { clear_token: true } }, "Removing…"), ["apps"]);
       break;
     case "login-add":
       collectLogins();
@@ -541,6 +574,13 @@ $("#view-settings").addEventListener("submit", async (e) => {
         renderSettings(["hosts"]);
         if (tested[host].ok) refresh();
       }
+      break;
+    }
+    case "apps": {
+      const body = { enabled: f.elements.enabled.checked };
+      if (v("token")) body.github_token = v("token").trim();
+      const r = await act(btn, "/api/settings", { apps: body }, "Saving…");
+      if (r) { toast("App update settings saved"); applySettings(r, ["apps"]); refresh(); }
       break;
     }
     case "docker": {

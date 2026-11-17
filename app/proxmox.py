@@ -9,7 +9,7 @@ import time
 
 import asyncssh
 
-from . import windows
+from . import apps, windows
 
 APT_FAMILY = {"debian", "ubuntu", "devuan", "raspbian", "linuxmint", "pop", "kali"}
 APK_FAMILY = {"alpine"}
@@ -204,6 +204,19 @@ class Host:
         entry["stacks"] = d["stacks"] if d else None
         entry["docker_error"] = d["error"] if d else None
 
+    async def _add_app(self, conn, entry, vmid):
+        """Note the community-scripts app in a container, if it has one (/usr/bin/update)."""
+        try:
+            entry["app"] = apps.parse_detect(await self._exec(conn, "lxc", vmid, apps.DETECT, 30))
+        except Exception:
+            entry["app"] = None  # not worth failing the whole check over
+
+    async def check_app(self, vmid):
+        entry = {}
+        async with self._connect() as conn:
+            await self._add_app(conn, entry, vmid)
+        return entry
+
     async def check_docker(self, kind, vmid):
         entry = {}
         async with self._connect() as conn:
@@ -236,7 +249,7 @@ class Host:
         return {"vmid": int(g["vmid"]), "type": kind, "name": g.get("name") or str(g["vmid"]),
                 "status": g.get("status"), "os": None, "packages": [], "reboot": False,
                 "error": None, "warning": None, "checked_at": time.time(),
-                "stacks": None, "docker_error": None, "unsupported": False}
+                "stacks": None, "docker_error": None, "unsupported": False, "app": None}
 
     @staticmethod
     def _fill(entry, fam, out):
@@ -262,6 +275,7 @@ class Host:
             listing_cmd = APT_LIST if fam == "apt" else APK_LIST
             self._fill(entry, fam, await self._run(conn, ct_cmd(vmid, f"{listing_cmd}; echo __REBOOT__; {CT_REBOOT}")))
             await self._add_docker(conn, entry, "lxc", vmid)
+            await self._add_app(conn, entry, vmid)
         except Exception as e:  # one broken container should not fail the whole host
             entry["error"] = str(e)
         return entry

@@ -82,6 +82,7 @@ function findTarget(hostName, vmid, stack) {
   if (!h) return null;
   const t = vmid == null ? h : h.containers.find((c) => c.vmid === vmid);
   if (!stack || !t) return t;
+  if (stack === APP) return t.app || null;
   const stacks = (vmid == null ? (t.host || {}).stacks : t.stacks) || [];
   return stacks.find((x) => x.name === stack) || null;
 }
@@ -98,6 +99,48 @@ function targetActions(hostName, vmid, t, n, label, stack) {
   }
   if (!n) return "";
   return `<button class="btn small ${vmid == null && !stack ? "" : "primary"}" data-dialog="${h}"${v}>${label}</button>`;
+}
+
+const APP = "@app";  // reserved stack name for a container's community-scripts app
+
+const COMP_STATUS = { update: ["warn", "New version"], current: ["ok", "Current"], unknown: ["", "Can't check"] };
+
+function appRow(host, c) {
+  const a = c.app;
+  if (!a || c.status !== "running") return "";
+  const key = `${host.name}/${c.vmid}/app`;
+  const n = a.updates || 0;
+  const comps = a.components || [];
+  let stateHtml;
+  if (a.job) stateHtml = jobPill(a.job);
+  else if (a.status === "update") stateHtml = `<button class="pill warn" data-pkgs="${esc(key)}" title="Show versions">${n} app update${n === 1 ? "" : "s"} ▾</button>`;
+  else if (a.status === "current") stateHtml = `<button class="pill ok" data-pkgs="${esc(key)}" title="Show versions">App current ▾</button>`;
+  else stateHtml = `<button class="pill" data-pkgs="${esc(key)}" title="${esc(a.note || "")}">Can't check ▾</button>`;
+  stateHtml += scheduleTag(a);
+  const canRun = a.status === "update" || a.status === "unknown";
+  const detail = comps.length
+    ? comps.map((x) => {
+        const [cls, label] = COMP_STATUS[x.status] || ["", x.status];
+        const ver = x.installed ? `${esc(x.installed)}${x.latest ? ` → ${esc(x.latest)}` : ""} · ` : "";
+        return `<span>${esc(x.app)}</span><span class="${cls}-text">${ver}${label}${x.note ? ` · ${esc(x.note)}` : ""}</span>`;
+      }).join("")
+    : `<span>${esc(a.name || "app")}</span><span>${esc(a.note || "Can't check")}</span>`;
+  return `
+    <div class="row stack-row">
+      <div class="ct-name"><span class="whale" aria-hidden="true">🧩</span><strong>${esc(a.name || "app")}</strong><span class="kind-tag">community-scripts</span></div>
+      <div class="os"></div>
+      <div class="state">${stateHtml}</div>
+      <div class="row-actions">${targetActions(host.name, c.vmid, a, canRun ? Math.max(n, 1) : 0, a.status === "update" ? "Update…" : "Run update…", APP)}</div>
+      ${openPkgs.has(key) ? `<div class="pkgs imgs">${detail}</div>` : ""}
+    </div>`;
+}
+
+function allApps() {
+  const out = [];
+  for (const h of state.hosts) for (const c of h.containers) {
+    if (c.status === "running" && c.app && c.app.updates) out.push({ host: h.name, vmid: c.vmid, app: c.app });
+  }
+  return out;
 }
 
 const IMG_STATUS = { update: ["warn", "New version"], current: ["ok", "Current"], local: ["", "Local build"], unknown: ["", "Can't check"] };
@@ -161,7 +204,7 @@ function renderRow(host, c) {
         ${c.console ? `<a class="btn small" href="${esc(c.console)}" target="_blank" rel="noopener">Console</a>` : ""}
       </div>
       ${openPkgs.has(key) && n ? pkgList(c.packages) : ""}
-    </div>${running ? stackRows(host, c.vmid, c.stacks, c.docker_error) : ""}`;
+    </div>${running ? stackRows(host, c.vmid, c.stacks, c.docker_error) : ""}${appRow(host, c)}`;
 }
 
 function renderHost(h) {
@@ -243,10 +286,12 @@ function render() {
   const last = Math.max(0, ...state.hosts.map((h) => h.checked_at || 0));
   const next = state.next_check ? ` · next check ${clock(state.next_check)}` : "";
   const stacksPending = allStacks().filter((x) => x.st.updates && !x.st.job && !x.st.scheduled);
+  const appsPending = allApps().filter((x) => !x.app.job && !x.app.scheduled);
   const sched = (stacksPending.length ? ` · ${stacksPending.length} Docker stack${stacksPending.length === 1 ? "" : "s"} with updates` : "")
+    + (appsPending.length ? ` · ${appsPending.length} app update${appsPending.length === 1 ? "" : "s"}` : "")
     + (state.scheduled_count ? ` · ${state.scheduled_count} scheduled` : "");
   $("#summary").textContent = (total ? `${total} updates on ${targets} target${targets === 1 ? "" : "s"}` : "Everything up to date") + ` · checked ${ago(last || null)}${next}${sched}`;
-  const ctPending = stacksPending.length || state.hosts.some((h) => h.containers.some((c) => c.packages.length && !c.job && !c.scheduled && c.status === "running"));
+  const ctPending = stacksPending.length || appsPending.length || state.hosts.some((h) => h.containers.some((c) => c.packages.length && !c.job && !c.scheduled && c.status === "running"));
   $("#update-all").disabled = !ctPending;
   $("#check-all").disabled = state.hosts.some((h) => h.checking);
 }
@@ -312,9 +357,21 @@ function openUpdateDialog(host, vmid, all = false, stack = null) {
     $("#upd-override-text").textContent = `Also update the ${withPolicy} with their own maintenance schedule now (otherwise they're queued for their window)`;
     $("#upd-override").checked = false;
     const stk = allStacks().filter((x) => x.st.updates && !x.st.job && !x.st.scheduled && x.vmid != null);
-    $("#upd-docker-row").hidden = !stk.length;
-    $("#upd-docker-text").textContent = `Also update ${stk.length} Docker stack${stk.length === 1 ? "" : "s"} with new images`;
+    const apx = allApps().filter((x) => !x.app.job && !x.app.scheduled);
+    const parts = [];
+    if (stk.length) parts.push(`${stk.length} Docker stack${stk.length === 1 ? "" : "s"} with new images`);
+    if (apx.length) parts.push(`${apx.length} app update${apx.length === 1 ? "" : "s"}`);
+    $("#upd-docker-row").hidden = !parts.length;
+    $("#upd-docker-text").textContent = `Also update ${parts.join(" and ")}`;
     $("#upd-docker").checked = false;
+  } else if (stack === APP) {
+    const guest = findTarget(host, vmid);
+    const ups = (t.components || []).filter((x) => x.status === "update").map((x) => `${x.app} ${x.installed} → ${x.latest}`).join(", ");
+    title = `Update ${t.name || "app"}`;
+    sub = (ups ? `${ups}. ` : "Patchdeck can't tell whether this app has an update. ")
+      + `Runs the container's own update command (community-scripts) in ${guest.name}.`;
+    $("#upd-override-row").hidden = true;
+    $("#upd-docker-row").hidden = true;
   } else if (stack) {
     const guest = findTarget(host, vmid);
     const where = vmid == null ? host : `${guest.type === "vm" ? "VM" : "container"} ${guest.name} (${vmid}) on ${host}`;

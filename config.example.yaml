@@ -64,6 +64,10 @@ snapshots:
 windows_updates:
   drivers: false                  # include driver updates for Windows VMs
 
+apps:
+  enabled: true                   # check community-scripts apps (Seerr, …) for new versions
+  github_token: ""                # optional; raises GitHub's lookup limit from 60 to 5,000 an hour
+
 docker:
   enabled: true                   # check Compose stacks for new image versions
   prune: true                     # docker image prune -f after updating a stack
