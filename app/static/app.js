@@ -145,6 +145,10 @@ function allApps() {
 
 const IMG_STATUS = { update: ["warn", "New version"], current: ["ok", "Current"], local: ["", "Local build"], unknown: ["", "Can't check"] };
 
+// A compose stack that isn't running normally ("restarting(1)", "exited(1)", "running(2), exited(1)"…).
+const stackUnhealthy = (status) => /restarting|exited|dead|paused|created/i.test(status || "");
+const dirName = (path) => (path && path.includes("/") ? path.slice(0, path.lastIndexOf("/")) || "/" : "");
+
 function stackRows(host, vmid, stacks, dockerError) {
   let out = "";
   if (dockerError) out += `<div class="row stack-row"><div class="ct-name"><span class="whale" aria-hidden="true">🐳</span><span class="err">${esc(dockerError)}</span></div></div>`;
@@ -161,8 +165,8 @@ function stackRows(host, vmid, stacks, dockerError) {
     stateHtml += scheduleTag(st);
     out += `
       <div class="row stack-row">
-        <div class="ct-name"><span class="whale" aria-hidden="true">🐳</span><strong>${esc(st.name)}</strong></div>
-        <div class="os">${esc(st.status || "")}</div>
+        <div class="ct-name"><span class="whale" aria-hidden="true">🐳</span><strong>${esc(st.name)}</strong>${st.files && st.files.length ? `<span class="stack-path" title="${esc(st.files.join("\n"))}">${esc(dirName(st.files[0]))}</span>` : ""}</div>
+        <div class="os">${stackUnhealthy(st.status) ? `<span class="pill warn" title="Some containers in this stack aren't running normally. Check them with docker ps -a and docker logs.">${esc(st.status)}</span>` : esc(st.status || "")}</div>
         <div class="state">${stateHtml}</div>
         <div class="row-actions">${targetActions(host.name, vmid, st, n, "Update…", st.name)}</div>
         ${openPkgs.has(key) ? `<div class="pkgs imgs">${imgs.map((i) => {

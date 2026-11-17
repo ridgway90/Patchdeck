@@ -116,9 +116,10 @@ A 🧩 row under such a container shows its state:
 - Patchdeck needs outbound HTTPS to `raw.githubusercontent.com` and `api.github.com`. GitHub allows
   60 anonymous lookups an hour per IP; results are cached, but a token (no permissions needed) in
   Settings → App updates raises that to 5,000. It can also be set with `PATCHDECK_GITHUB_TOKEN`.
-- Containers whose `update` only runs an `apt` upgrade (the plain Debian, Ubuntu and Alpine scripts,
-  Cloudflared, …) get no 🧩 row: their packages already appear in the normal package check. A script
-  that does anything else, such as running the app's own updater, keeps its row.
+- Containers whose `update` only upgrades OS packages with `apt` or `apk` (the plain Debian, Ubuntu and
+  Alpine scripts, Cloudflared, the Docker script on Alpine, …) get no 🧩 row: their packages already
+  appear in the normal package check. A script that does anything else, such as running the app's own
+  updater or Docker's installer, keeps its row.
 - Turn the whole thing off under Settings → App updates.
 
 This follows the community-scripts' own conventions, which change from time to time; if an app that
@@ -134,6 +135,9 @@ local image with the digest of the same tag in its registry:
 - **New version**: the tag now points at a different image. **Update…** runs `docker compose pull`
   and `docker compose up -d` in the stack's folder, then `docker image prune -f` (can be turned off
   in Settings → General). Snapshots, maintenance windows and auto-update work as for OS updates.
+- Each stack shows the folder its compose file is in (the stack's name is the folder's name unless the
+  compose file sets one, so a file in `/root` is a stack called `root`), and a stack with containers that
+  aren't running normally, such as `restarting(1)`, is highlighted.
 - **Local build**: images built from a Dockerfile can't be compared and are skipped.
 - **Can't check**: private images, pinned digests, or a registry rate limit. Lookups use `HEAD`
   requests, which Docker Hub allows about 100 an hour per IP for anonymous clients; a homelab
