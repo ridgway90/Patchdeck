@@ -241,6 +241,7 @@ STATE = _load(STATE_FILE, {"hosts": {}, "notified": []})
 STATE.setdefault("hosts", {})
 STATE.setdefault("notified", [])
 STATE.setdefault("scheduled", [])  # updates waiting for the maintenance window
+STATE.setdefault("reboots", [])    # reboots Patchdeck was asked to do and hasn't confirmed done yet
 STATE["next_check"] = None
 
 
@@ -258,6 +259,7 @@ class Job:
         self.quiet = False  # maintenance-window jobs report in one summary instead
         self.reboot = False  # reboot afterwards if the update leaves a reboot pending
         self.stack = None    # set for a Docker Compose stack update
+        self.window = None   # the maintenance window this job runs in, if any
         self.status = "queued"
         self.summary = ""
         self.lines = []
@@ -403,6 +405,7 @@ async def run_check(job):
                 await annotate_apps(result["containers"])
             STATE["hosts"][job.host] = result
             save_state()
+            reconcile_reboots(job.host, result)
             n_ct = sum(len(c["packages"]) for c in result["containers"])
             for c in result["containers"]:
                 detail = (c["status"] if c["status"] != "running" else
@@ -654,6 +657,8 @@ async def run_update(job):
     h = HOSTS[job.host]
     async with HOST_LOCKS[job.host]:
         job.start()
+        if job.reboot:  # written down before anything happens, so it survives Patchdeck going down mid-way
+            want_reboot(job.host, job.vmid, job.window)
         try:
             if job.vmid is None:
                 before = len(STATE["hosts"].get(job.host, {}).get("host", {}).get("packages", []))
@@ -684,6 +689,8 @@ async def run_update(job):
                     await prune_snapshots(job, h, kind)
             job.log("Re-checking…")
             notes = []
+            if rc != 0 and job.reboot:
+                clear_reboot(job.host, job.vmid)  # a failed update isn't followed by a reboot
             try:
                 after = await recheck(job)
             except Exception as e:
@@ -692,6 +699,7 @@ async def run_update(job):
                 notes.append("re-check failed, run a check")
             if rc == 0 and after and after.get("reboot") and job.reboot:
                 try:
+                    mark_reboot_try(job.host, job.vmid)
                     if kind == "host":
                         job.log("Reboot required: rebooting the host in 1 minute")
                         await h.reboot_self()
@@ -723,6 +731,8 @@ async def run_update(job):
         except Exception as e:
             job.log(f"ERROR: {e}")
             job.finish("failed", str(e))
+    if job.reboot:
+        MAINT_CHANGED.set()  # a window may now be able to retry this target
     await notify_update(job)
 
 
@@ -741,6 +751,7 @@ async def recheck(job):
         cts = STATE["hosts"][job.host]["containers"]
         cts[:] = [after if c["vmid"] == job.vmid else c for c in cts]
     save_state()
+    reconcile_target(job.host, job.vmid, after)
     return after
 
 
@@ -820,6 +831,164 @@ async def scheduler():
             await check_all(auto=True)
         except Exception:
             log.exception("Scheduled check failed")
+
+
+# ---------------------------------------------------------------- pending reboots
+# When an update is asked to reboot afterwards, that wish is written down (and saved) before anything
+# happens, so it survives Patchdeck itself going down, for example because its own host rebooted
+# first. It is cleared only when a check shows the target no longer needs a reboot. Until then each
+# maintenance window retries the reboot, up to MAX_REBOOT_RETRIES times, then gives up and says so.
+
+MAX_REBOOT_RETRIES = 3
+REBOOT_COOLDOWN = 900  # seconds after an attempt before Patchdeck judges it, or tries again
+
+
+def reboot_entry(host, vmid):
+    return next((r for r in STATE["reboots"] if r["host"] == host and r["vmid"] == vmid), None)
+
+
+def want_reboot(host, vmid, window=None):
+    e = reboot_entry(host, vmid)
+    if e is None:
+        e = {"host": host, "vmid": vmid, "name": target_name(host, vmid), "window": window,
+             "retries": 0, "gave_up": False, "since": time.time()}
+        STATE["reboots"].append(e)
+    else:  # a new request starts over
+        e.update(window=window or e.get("window"), retries=0, gave_up=False)
+    save_state()
+    MAINT_CHANGED.set()
+
+
+def clear_reboot(host, vmid):
+    n = len(STATE["reboots"])
+    STATE["reboots"] = [r for r in STATE["reboots"] if not (r["host"] == host and r["vmid"] == vmid)]
+    if len(STATE["reboots"]) != n:
+        save_state()
+
+
+def reconcile_target(host, vmid, entry):
+    """A fresh look at a target: if it no longer needs a reboot, the wish is fulfilled."""
+    if entry is not None and not entry.get("error") and not entry.get("reboot"):
+        clear_reboot(host, vmid)
+
+
+def reconcile_reboots(host, result):
+    for r in list(STATE["reboots"]):
+        if r["host"] != host:
+            continue
+        t = result.get("host") if r["vmid"] is None else \
+            next((c for c in result.get("containers", []) if c["vmid"] == r["vmid"]), None)
+        reconcile_target(host, r["vmid"], t)
+
+
+def mark_reboot_try(host, vmid):
+    e = reboot_entry(host, vmid)
+    if e is not None:
+        e["last_try"] = time.time()
+        save_state()
+
+
+def reboot_ready(e):
+    """Worth retrying now: not given up, not in the middle of an update, and long enough since the
+    last attempt for the target to have come back (so a reboot just issued isn't repeated)."""
+    return (not e.get("gave_up") and e["host"] in HOSTS and not active_job(e["host"], e["vmid"])
+            and time.time() - e.get("last_try", 0) > REBOOT_COOLDOWN)
+
+
+def reboot_window_name(entry):
+    """Where a reboot is retried: the window the update ran in, else the target's own schedule
+    window, else the first window. None when there are no windows (then nothing is retried)."""
+    for name in (entry.get("window"), SCHEDULES.get(target_key(entry["host"], entry["vmid"]), {}).get("window")):
+        if name and window_named(name):
+            return name
+    return WINDOWS[0]["name"] if WINDOWS else None
+
+
+def reboot_plan(host, vmid):
+    e = reboot_entry(host, vmid)
+    if not e:
+        return None
+    name = reboot_window_name(e)
+    win = None
+    if name:
+        occ = occurrence(window_named(name))
+        if occ and e.get("last_try") and occ[0].timestamp() <= e["last_try"]:  # this one is already used up
+            occ = occurrence(window_named(name), occ[1] + dt.timedelta(seconds=1))
+        win = {"name": name, "start": occ[0].timestamp() if occ else None, "end": occ[1].timestamp() if occ else None}
+    return {"window": win, "retries": e.get("retries", 0),
+            "gave_up": bool(e.get("gave_up")), "max": MAX_REBOOT_RETRIES}
+
+
+async def run_reboot(job):
+    """One retry of a pending reboot, inside a maintenance window."""
+    h = HOSTS.get(job.host)
+    if h is None:
+        job.start()
+        return job.finish("failed", "Host was removed")
+    async with HOST_LOCKS[job.host]:
+        job.start()
+        try:
+            job.log("Checking whether a reboot is still pending…")
+            after = await recheck(job)  # a check that finds nothing pending also clears the flag
+            e = reboot_entry(job.host, job.vmid)
+            if e is None or not after.get("reboot"):
+                clear_reboot(job.host, job.vmid)
+                return job.finish("success", "no reboot is pending any more")
+            if e.get("retries", 0) >= MAX_REBOOT_RETRIES:
+                e["gave_up"] = True
+                save_state()
+                job.log(f"Still pending after {MAX_REBOOT_RETRIES} reboot attempts.")
+                return job.finish("failed", f"still needs a reboot after {MAX_REBOOT_RETRIES} attempts; "
+                                            "Patchdeck has stopped trying, reboot it by hand")
+            e["retries"] = n = e.get("retries", 0) + 1
+            e["last_try"] = time.time()
+            save_state()
+            kind = target_kind(job.host, job.vmid)
+            if kind == "host":
+                job.log(f"Rebooting {job.host} in 1 minute (attempt {n} of {MAX_REBOOT_RETRIES})…")
+                await h.reboot_self()
+                spawn(delayed_check(job.host, 420))
+                return job.finish("success", f"rebooting (attempt {n} of {MAX_REBOOT_RETRIES}); "
+                                             "the flag clears once it has been checked again")
+            job.log(f"Rebooting {job.name} (attempt {n} of {MAX_REBOOT_RETRIES})…")
+            is_win = (find_ct(job.host, job.vmid) or {}).get("os") == "mswindows"
+            if not await h.reboot_guest(job.vmid, kind, job.log, wait=1200 if is_win else 300):
+                return job.finish("warning", f"rebooted (attempt {n} of {MAX_REBOOT_RETRIES}) but it isn't back yet")
+            after = await recheck(job)
+            if after.get("reboot"):
+                return job.finish("warning", f"rebooted (attempt {n} of {MAX_REBOOT_RETRIES}) but a reboot is still pending")
+            job.finish("success", f"rebooted (attempt {n} of {MAX_REBOOT_RETRIES})")
+        except Exception as ex:
+            job.log(f"ERROR: {ex}")
+            job.finish("failed", str(ex))
+
+
+async def run_reboot_retries(w, end):
+    """At a window: retry every pending reboot that belongs to it (guests before their host)."""
+    entries = [e for e in STATE["reboots"] if reboot_window_name(e) == w["name"] and reboot_ready(e)]
+    if not entries:
+        return
+    done = []
+
+    async def per_host(host, es):
+        for e in sorted(es, key=lambda x: x["vmid"] is None):
+            if dt.datetime.now() >= end:
+                return
+            job = Job("reboot", host, e["vmid"], e["name"])
+            job.quiet, job.window = True, w["name"]
+            JOBS[job.id] = job
+            await run_reboot(job)
+            done.append(job)
+
+    by_host = {}
+    for e in entries:
+        by_host.setdefault(e["host"], []).append(e)
+    await asyncio.gather(*(per_host(h, es) for h, es in by_host.items()))
+    if DISCORD.get("webhook") and done:
+        icon = {"success": "✅", "failed": "❌", "warning": "⚠️"}
+        lines = [f"🔁 **{w['name']}** pending reboots"]
+        lines += [f"{icon.get(j.status, '•')} **{j.name}** `{j.host}`: {j.summary}" for j in done]
+        await discord(DISCORD["webhook"], "\n".join(lines))
 
 
 # ---------------------------------------------------------------- maintenance windows
@@ -936,11 +1105,13 @@ async def queue_auto_updates(w):
     save_state()
 
 
-async def run_window(w, end, auto):
+async def run_window(w, end, auto, reboots=False):
     try:
         if auto:
             await queue_auto_updates(w)
         await run_maintenance(w, end)
+        if reboots:  # after the updates, so a reboot never interrupts one
+            await run_reboot_retries(w, end)
     except Exception:
         log.exception("Maintenance window %s failed", w["name"])
     finally:
@@ -975,7 +1146,7 @@ async def run_maintenance(w, end):
                 skipped.append(it["name"])
                 continue
             job = Job("update", host, it["vmid"], it["name"], snapshot=it.get("snapshot"), batch=batch)
-            job.quiet, job.reboot, job.stack = True, bool(it.get("reboot")), stack
+            job.quiet, job.reboot, job.stack, job.window = True, bool(it.get("reboot")), stack, w["name"]
             JOBS[job.id] = job
             await run_update(job)
             done.append(job)
@@ -1022,10 +1193,21 @@ async def maintenance_loop():
             wants_auto = key not in AUTO_DONE and any(
                 p["auto"] and p["window"] == w["name"] for p in SCHEDULES.values())
             has_items = any(item_window(i) == w["name"] for i in STATE["scheduled"])
-            if wants_auto or has_items:
+            reboot_key = ("reboot", w["name"], start.timestamp())  # reboot retries run once per window
+            wants_reboot = reboot_key not in AUTO_DONE and any(
+                reboot_window_name(e) == w["name"] and reboot_ready(e) for e in STATE["reboots"])
+            for e in STATE["reboots"]:  # look again when an attempt's cooldown ends while the window is open
+                if reboot_key not in AUTO_DONE and not e.get("gave_up") and e.get("last_try") \
+                        and reboot_window_name(e) == w["name"]:
+                    ready_at = dt.datetime.fromtimestamp(e["last_try"] + REBOOT_COOLDOWN + 1)
+                    if now < ready_at < end:
+                        wakes.append(ready_at)
+            if wants_auto or has_items or wants_reboot:
                 AUTO_DONE.add(key)
+                if wants_reboot:
+                    AUTO_DONE.add(reboot_key)
                 RUNNING_WINDOWS.add(w["name"])
-                spawn(run_window(w, end, wants_auto))
+                spawn(run_window(w, end, wants_auto, wants_reboot))
         wake = min(wakes) if wakes else None
         wait = max(1, (wake - now).total_seconds()) if wake else None
         try:
@@ -1034,9 +1216,22 @@ async def maintenance_loop():
             pass
 
 
+async def startup_reboot_check():
+    """After Patchdeck starts (often because its own host just rebooted), check the targets with a
+    pending reboot so the ones that did reboot are confirmed and cleared."""
+    if not STATE["reboots"]:
+        return
+    await asyncio.sleep(float(os.environ.get("PATCHDECK_STARTUP_CHECK_DELAY", "45")))
+    hosts = sorted({r["host"] for r in STATE["reboots"]} & set(HOSTS))
+    jobs = [Job("check", h, auto=True) for h in hosts]
+    for j in jobs:
+        JOBS[j.id] = j
+    await asyncio.gather(*(run_check(j) for j in jobs))
+
+
 @contextlib.asynccontextmanager
 async def lifespan(app):
-    tasks = [spawn(scheduler()), spawn(maintenance_loop())]
+    tasks = [spawn(scheduler()), spawn(maintenance_loop()), spawn(startup_reboot_check())]
     yield
     for t in tasks:
         t.cancel()
@@ -1126,12 +1321,14 @@ def build_state():
             c.setdefault("type", "lxc")
             c["stacks"] = deco_stacks(name, c["vmid"], c.get("stacks"))
             c["app"] = deco_app(name, c["vmid"], c.get("app"))
+            c["reboot_plan"] = reboot_plan(name, c["vmid"])
             containers.append(c)
         hj = active_job(name, None)
         hosts.append({
             "name": name, "address": h.address, "node": node, "kind": h.kind,
             "scheduled": sched_public(name, None),
             "schedule": SCHEDULES.get(target_key(name, None)),
+            "reboot_plan": reboot_plan(name, None),
             "host": ({**s["host"], "stacks": deco_stacks(name, None, s["host"].get("stacks"))}
                      if s.get("host") else None),
             "containers": containers,
@@ -1593,6 +1790,10 @@ async def api_host_save(request: Request):
             if it["host"] == original:
                 it["host"] = name
                 it["name"] = target_name(name, it["vmid"], it.get("stack"))
+        for r in STATE["reboots"]:
+            if r["host"] == original:
+                r["host"] = name
+                r["name"] = target_name(name, r["vmid"])
         save_state()
         MAINT_CHANGED.set()
     return settings_payload()
@@ -1610,6 +1811,7 @@ async def api_host_delete(request: Request):
                             if not k.startswith(h.name + "/")}
     STATE["hosts"].pop(h.name, None)
     STATE["scheduled"] = [i for i in STATE["scheduled"] if i["host"] != h.name]
+    STATE["reboots"] = [r for r in STATE["reboots"] if r["host"] != h.name]
     save_state()
     return settings_payload()
 
