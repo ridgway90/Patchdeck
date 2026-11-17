@@ -41,6 +41,10 @@ for f in /root/.[A-Za-z0-9]* /opt/*_version.txt; do
 done
 """
 
+# Plain operating-system containers: their `update` only upgrades OS packages, which Patchdeck's
+# normal package check already covers, so they get no app row.
+OS_ONLY = {"debian", "ubuntu", "alpine", "devuan"}
+
 NAME_FROM_UPDATE = [
     re.compile(r'UPDATE_SCRIPT_NAME="?([A-Za-z0-9][A-Za-z0-9._-]*)'),
     re.compile(r"/ct/([A-Za-z0-9][A-Za-z0-9._-]*)\.sh"),
@@ -56,7 +60,8 @@ SPINNER = re.compile(r"^[⠀-⣿]\s*")
 # ---------- reading what's inside the container
 
 def parse_detect(out):
-    """Name and recorded versions, or None when the guest has no /usr/bin/update."""
+    """Name and recorded versions, or None when the guest has no /usr/bin/update (or only the
+    plain-OS one)."""
     if "__NOUPDATE__" in out or "__UPDATE__" not in out:
         return None
     body = out.split("__UPDATE__", 1)[1]
@@ -67,6 +72,8 @@ def parse_detect(out):
         if m:
             name = m.group(1)
             break
+    if name and name.lower() in OS_ONLY:
+        return None
     versions = {}
     for line in vers.splitlines():
         path, sep, val = line.partition("\t")
