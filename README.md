@@ -116,8 +116,9 @@ A 🧩 row under such a container shows its state:
 - Patchdeck needs outbound HTTPS to `raw.githubusercontent.com` and `api.github.com`. GitHub allows
   60 anonymous lookups an hour per IP; results are cached, but a token (no permissions needed) in
   Settings → App updates raises that to 5,000. It can also be set with `PATCHDECK_GITHUB_TOKEN`.
-- Containers made with the plain Debian, Ubuntu or Alpine scripts get no 🧩 row: their `update` only
-  upgrades OS packages, which Patchdeck already covers.
+- Containers whose `update` only runs an `apt` upgrade (the plain Debian, Ubuntu and Alpine scripts,
+  Cloudflared, …) get no 🧩 row: their packages already appear in the normal package check. A script
+  that does anything else, such as running the app's own updater, keeps its row.
 - Turn the whole thing off under Settings → App updates.
 
 This follows the community-scripts' own conventions, which change from time to time; if an app that

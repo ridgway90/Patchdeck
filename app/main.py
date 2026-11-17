@@ -411,7 +411,7 @@ async def run_check(job):
                 for st in c.get("stacks") or []:
                     job.log(f"         🐳 {st['name']:<21} {st.get('updates', 0)} image update(s)")
                 a = c.get("app")
-                if a:
+                if a and a.get("status") != "os":
                     job.log(f"         🧩 {(a.get('name') or 'app'):<21} " + (
                         f"{a['updates']} app update(s)" if a.get("status") == "update"
                         else "current" if a.get("status") == "current" else "can't check"))
@@ -1145,7 +1145,7 @@ def deco_stacks(host, vmid, stacks):
 
 
 def deco_app(host, vmid, app):
-    if not app or not APPS["enabled"]:
+    if not app or not APPS["enabled"] or app.get("status") == "os":
         return None
     j = active_job(host, vmid, APP)
     return {**app, "job": j.public() if j else None, "scheduled": sched_public(host, vmid, APP),
@@ -1338,7 +1338,7 @@ def settings_payload():
                      "stacks": [st["name"] for st in (STATE["hosts"].get(n, {}).get("host") or {}).get("stacks") or []],
                      "containers": [
             {"vmid": c["vmid"], "name": c["name"], "type": c.get("type", "lxc"),
-             "stacks": [st["name"] for st in c.get("stacks") or []], "app": bool(c.get("app"))}
+             "stacks": [st["name"] for st in c.get("stacks") or []], "app": bool(c.get("app")) and c["app"].get("status") != "os"}
             for c in STATE["hosts"].get(n, {}).get("containers", []) if c["vmid"] not in EXCLUDE]}
             for n, h in HOSTS.items()],
         "host_kinds": HOST_KINDS,
