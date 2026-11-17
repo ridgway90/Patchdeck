@@ -67,6 +67,7 @@ windows_updates:
 apps:
   enabled: true                   # check community-scripts apps (Seerr, …) for new versions
   github_token: ""                # optional; raises GitHub's lookup limit from 60 to 5,000 an hour
+  show_manual: true               # also list apps that have to be updated by hand (no version check)
 
 docker:
   enabled: true                   # check Compose stacks for new image versions

@@ -161,11 +161,11 @@ def parse_components(text):
         if len(args) < 2:
             continue
         app, repo = args[0], args[1]
-        comp = {"app": app, "repo": repo, "note": None}
+        comp = {"app": app, "repo": repo, "note": None, "manual": False}
         if "$" in app or "$" in repo or not APP_RE.match(app) or not REPO_RE.match(repo):
-            comp.update(repo=None, note="the script builds the app or repository name at run time")
+            comp.update(repo=None, manual=True, note="the script builds the app or repository name at run time")
         elif len(args) > 2:
-            comp.update(note="the script pins or filters versions, which Patchdeck can't follow")
+            comp.update(manual=True, note="the script pins or filters versions, which Patchdeck can't follow")
         if (comp["app"], comp["repo"]) not in seen:
             seen.add((comp["app"], comp["repo"]))
             out.append(comp)
@@ -249,7 +249,7 @@ def _norm(v):
 
 async def _component(client, comp, versions, token):
     out = {"app": comp["app"], "repo": comp["repo"], "installed": installed_version(versions, comp["app"]),
-           "latest": None, "status": "unknown", "note": comp["note"]}
+           "latest": None, "status": "unknown", "note": comp["note"], "manual": comp.get("manual", False)}
     if comp["note"] or not comp["repo"]:
         return out
     if not out["installed"]:
@@ -280,8 +280,9 @@ async def _annotate_one(client, app, token):
         app["note"] = "this app updates through the OS package manager, which the package check already covers"
         return
     if not comps:
-        app["note"] = ("this app's script doesn't check GitHub releases, so Patchdeck can't tell whether "
-                       "it has an update; run its update to find out")
+        app["status"] = "manual"  # the app has its own updater; there's nothing to compare in advance
+        app["note"] = ("this app updates itself when you run its update command, so there is no version "
+                       "to compare in advance; run it to update")
         return
     app["components"] = list(await asyncio.gather(
         *(_component(client, c, app.get("versions") or {}, token) for c in comps)))
@@ -290,6 +291,9 @@ async def _annotate_one(client, app, token):
         app["status"] = "update"
     elif all(c["status"] == "current" for c in app["components"]):
         app["status"] = "current"
+    elif all(c.get("manual") for c in app["components"]):
+        app["status"] = "manual"
+        app["note"] = next((c["note"] for c in app["components"] if c.get("note")), None)
     else:
         app["note"] = next((c["note"] for c in app["components"] if c["status"] == "unknown" and c["note"]), None)
 

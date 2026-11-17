@@ -111,8 +111,14 @@ A 🧩 row under such a container shows its state:
 - **App update** (or **Run update…** when Patchdeck can't tell) runs the container's own
   `update` command, streams its output, and re-checks afterwards. Snapshots, maintenance windows and
   auto-update work as for the rest; it gives up after 60 minutes in case the script waits for input.
-- **Can't check** means this app's script doesn't use GitHub releases, pins a version, or its script
-  couldn't be read. The update can still be run by hand from the 🧩 row.
+- **Update by hand** is for apps that have their own updater and no version to compare in advance (the
+  script doesn't use GitHub releases, or pins a version; AdGuard Home on Alpine runs `AdGuardHome
+  --update`). Patchdeck can't tell whether there is anything to install, so the row offers **Run update…**
+  as a quiet button, and **Auto** and **Update all** leave it out, since they only act on a known update.
+  If you'd rather not see these rows, untick *Also list apps that have to be updated by hand* in
+  Settings → App updates.
+- **Can't check right now** means a lookup failed (GitHub unreachable or rate-limited, the app's script
+  couldn't be read, or no installed version is recorded); it clears on a later check.
 - Patchdeck needs outbound HTTPS to `raw.githubusercontent.com` and `api.github.com`. GitHub allows
   60 anonymous lookups an hour per IP; results are cached, but a token (no permissions needed) in
   Settings → App updates raises that to 5,000. It can also be set with `PATCHDECK_GITHUB_TOKEN`.

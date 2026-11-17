@@ -115,9 +115,13 @@ function appRow(host, c) {
   if (a.job) stateHtml = jobPill(a.job);
   else if (a.status === "update") stateHtml = `<button class="pill warn" data-pkgs="${esc(key)}" title="Show versions">${n} app update${n === 1 ? "" : "s"} ▾</button>`;
   else if (a.status === "current") stateHtml = `<button class="pill ok" data-pkgs="${esc(key)}" title="Show versions">App current ▾</button>`;
-  else stateHtml = `<button class="pill" data-pkgs="${esc(key)}" title="${esc(a.note || "")}">Can't check ▾</button>`;
+  else if (a.status === "manual") stateHtml = `<button class="pill" data-pkgs="${esc(key)}" title="${esc(a.note || "")}">Update by hand ▾</button>`;
+  else stateHtml = `<button class="pill" data-pkgs="${esc(key)}" title="${esc(a.note || "")}">Can't check right now ▾</button>`;
   stateHtml += scheduleTag(a);
-  const canRun = a.status === "update" || a.status === "unknown";
+  const canRun = a.status === "update" || a.status === "unknown" || a.status === "manual";
+  // Only a real update is the main action; running an app's own updater blind is a quieter button.
+  let actions = targetActions(host.name, c.vmid, a, canRun ? Math.max(n, 1) : 0, a.status === "update" ? "Update…" : "Run update…", APP);
+  if (a.status !== "update") actions = actions.replace("btn small primary", "btn small");
   const detail = comps.length
     ? comps.map((x) => {
         const [cls, label] = COMP_STATUS[x.status] || ["", x.status];
@@ -130,7 +134,7 @@ function appRow(host, c) {
       <div class="ct-name"><span class="whale" aria-hidden="true">🧩</span><strong>${esc(a.name || "app")}</strong><span class="kind-tag">community-scripts</span></div>
       <div class="os"></div>
       <div class="state">${stateHtml}</div>
-      <div class="row-actions">${targetActions(host.name, c.vmid, a, canRun ? Math.max(n, 1) : 0, a.status === "update" ? "Update…" : "Run update…", APP)}</div>
+      <div class="row-actions">${actions}</div>
       ${openPkgs.has(key) ? `<div class="pkgs imgs">${detail}</div>` : ""}
     </div>`;
 }
