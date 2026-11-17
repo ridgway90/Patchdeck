@@ -136,8 +136,13 @@ local image with the digest of the same tag in its registry:
   and `docker compose up -d` in the stack's folder, then `docker image prune -f` (can be turned off
   in Settings → General). Snapshots, maintenance windows and auto-update work as for OS updates.
 - Each stack shows the folder its compose file is in (the stack's name is the folder's name unless the
-  compose file sets one, so a file in `/root` is a stack called `root`), and a stack with containers that
-  aren't running normally, such as `restarting(1)`, is highlighted.
+  compose file sets one, so a file in `/root` is a stack called `root`). If a container in a stack is
+  restarting, dead, exited with an error, or reports itself unhealthy, the row says so (for example
+  `⚠ radarr is restarting`). A container that exited with code 0, such as a one-shot setup job, is fine.
+- **After updating a stack**, Patchdeck watches it for about 20 seconds (restart counts and container
+  states) and, if a container is crash-looping or has stopped with an error, finishes the update as a
+  **warning** instead of a success, with the reason, and flags it in the Discord message. This can be
+  turned off in Settings → Docker.
 - **Local build**: images built from a Dockerfile can't be compared and are skipped.
 - **Can't check**: private images, pinned digests, or a registry rate limit. Lookups use `HEAD`
   requests, which Docker Hub allows about 100 an hour per IP for anonymous clients; a homelab

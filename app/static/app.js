@@ -145,8 +145,6 @@ function allApps() {
 
 const IMG_STATUS = { update: ["warn", "New version"], current: ["ok", "Current"], local: ["", "Local build"], unknown: ["", "Can't check"] };
 
-// A compose stack that isn't running normally ("restarting(1)", "exited(1)", "running(2), exited(1)"…).
-const stackUnhealthy = (status) => /restarting|exited|dead|paused|created/i.test(status || "");
 const dirName = (path) => (path && path.includes("/") ? path.slice(0, path.lastIndexOf("/")) || "/" : "");
 
 function stackRows(host, vmid, stacks, dockerError) {
@@ -163,13 +161,17 @@ function stackRows(host, vmid, stacks, dockerError) {
     const unknown = imgs.filter((i) => i.status === "unknown").length;
     if (unknown && !st.job) stateHtml += `<span class="pill" title="${esc(imgs.filter((i) => i.status === "unknown").map((i) => `${i.ref}: ${i.note}`).join("\n"))}">${unknown} unchecked</span>`;
     stateHtml += scheduleTag(st);
+    const pr = st.problems || [];
+    if (pr.length && !st.job) {  // say what is wrong, right in the row
+      stateHtml = `<button class="pill warn" data-pkgs="${esc(key)}" title="${esc(pr.join("\n"))}">⚠ ${pr.length === 1 ? esc(pr[0]) : `${pr.length} problems`} ▾</button>` + stateHtml;
+    }
     out += `
       <div class="row stack-row">
         <div class="ct-name"><span class="whale" aria-hidden="true">🐳</span><strong>${esc(st.name)}</strong>${st.files && st.files.length ? `<span class="stack-path" title="${esc(st.files.join("\n"))}">${esc(dirName(st.files[0]))}</span>` : ""}</div>
-        <div class="os">${stackUnhealthy(st.status) ? `<span class="pill warn" title="Some containers in this stack aren't running normally. Check them with docker ps -a and docker logs.">${esc(st.status)}</span>` : esc(st.status || "")}</div>
+        <div class="os">${esc(st.status || "")}</div>
         <div class="state">${stateHtml}</div>
         <div class="row-actions">${targetActions(host.name, vmid, st, n, "Update…", st.name)}</div>
-        ${openPkgs.has(key) ? `<div class="pkgs imgs">${imgs.map((i) => {
+        ${openPkgs.has(key) ? `<div class="pkgs imgs">${(st.problems || []).map((p) => `<span class="warn-text">⚠</span><span class="warn-text">${esc(p)}</span>`).join("")}${imgs.map((i) => {
           const [cls, label] = IMG_STATUS[i.status] || ["", i.status];
           return `<span>${esc(i.ref)}</span><span class="${cls}-text" title="${esc(i.note || "")}">${label}${i.note ? ` · ${esc(i.note)}` : ""}</span>`;
         }).join("")}</div>` : ""}
@@ -249,7 +251,7 @@ function renderHost(h) {
 
 function renderJobs(jobs) {
   if (!jobs.length) return `<li class="muted" style="cursor:default"><span></span><span></span><span>Nothing yet</span></li>`;
-  const cls = { success: "ok", failed: "bad", running: "info running", queued: "info" };
+  const cls = { success: "ok", failed: "bad", warning: "warn", running: "info running", queued: "info" };
   return jobs.slice(0, 12).map((j) => `
     <li data-log="${esc(j.id)}">
       <span class="when">${clock(j.created)}</span>
@@ -319,7 +321,7 @@ function openLog(jobId, title) {
   const job = state && state.jobs.find((j) => j.id === jobId);
   $("#log-title").textContent = title || (job ? `${job.kind === "check" ? "Check" : "Update"} · ${job.kind === "check" ? job.host : job.name}` : "Job");
   const status = $("#log-status");
-  const setStatus = (s) => { status.textContent = s; status.className = "pill " + ({ success: "ok", failed: "bad" }[s] || "info running"); };
+  const setStatus = (s) => { status.textContent = s; status.className = "pill " + ({ success: "ok", failed: "bad", warning: "warn" }[s] || "info running"); };
   setStatus(job ? job.status : "running");
   const body = $("#log-body");
   body.textContent = "";

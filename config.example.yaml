@@ -71,6 +71,7 @@ apps:
 docker:
   enabled: true                   # check Compose stacks for new image versions
   prune: true                     # docker image prune -f after updating a stack
+  health_check: true              # after updating a stack, watch it and warn if it keeps restarting
   logins:                         # optional; easier to add under Settings → Docker
     - registry: docker.io
       username: your-docker-id
