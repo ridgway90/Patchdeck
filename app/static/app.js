@@ -190,6 +190,18 @@ function scheduleTag(t) {
   return `<span class="pill sched-tag" title="Maintenance schedule: ${esc(p.window)}${p.auto ? ", updates automatically" : ""}${p.reboot ? ", reboots if needed" : ""}">🌙 ${esc(p.window)}${p.auto ? " · auto" : ""}</span>`;
 }
 
+/* A reboot Patchdeck was asked to do and hasn't confirmed yet (it retries in a maintenance window). */
+function rebootPlan(t) {
+  const p = t.reboot_plan;
+  if (!p) return "";
+  if (p.gave_up) return `<span class="pill bad" title="Patchdeck tried ${p.max} times and a reboot is still pending. Reboot it by hand; this clears once a check shows it no longer needs one.">🔁 gave up after ${p.max} tries</span>`;
+  const w = p.window;
+  const when = w ? (w.start ? fmtWhen(w.start) : w.name) : "";
+  if (!w) return `<span class="pill" title="Patchdeck will retry once a maintenance window exists (Settings).">🔁 reboot requested · no window</span>`;
+  if (!p.retries) return `<span class="pill info" title="Patchdeck asked for a reboot. If it hasn't happened it retries in ${esc(w.name)} (${when}), up to ${p.max} times.">🔁 reboot requested</span>`;
+  return `<span class="pill info" title="${p.retries} of ${p.max} retries used. Next attempt in ${esc(w.name)}.">🔁 retried ${p.retries}/${p.max} · next ${esc(when)}</span>`;
+}
+
 function renderRow(host, c) {
   const key = `${host.name}/${c.vmid}`;
   const n = c.packages.length;
@@ -201,6 +213,7 @@ function renderRow(host, c) {
   else if (c.error) stateHtml = `<span class="pill bad">Check failed</span><span class="err" title="${esc(c.error)}">${esc(c.error)}</span>`;
   else stateHtml = n ? `<button class="pill ${n >= 20 ? "bad" : "warn"}" data-pkgs="${esc(key)}" title="Show packages">${n} update${n === 1 ? "" : "s"} ▾</button>` : countPill(0);
   if (c.reboot) stateHtml += `<span class="pill bad">Reboot needed</span>`;
+  stateHtml += rebootPlan(c);
   if (c.warning) stateHtml += `<span class="pill warn" title="${esc(c.warning)}">!</span>`;
   stateHtml += scheduleTag(c);
 
@@ -226,6 +239,7 @@ function renderHost(h) {
   if (h.job) meta += jobPill(h.job);
   else if (n !== null) meta += n ? `<button class="pill ${n >= 20 ? "bad" : "warn"}" data-pkgs="${esc(key)}">Host: ${n} update${n === 1 ? "" : "s"} ▾</button>` : `<span class="pill ok">Host up to date</span>`;
   if (h.host && h.host.reboot) meta += `<span class="pill bad">Reboot needed</span>`;
+  meta += rebootPlan(h);
   if (h.error) meta += `<span class="pill bad" title="${esc(h.error)}">Unreachable</span><span class="err" title="${esc(h.error)}">${esc(h.error)}</span>`;
 
   const cts = h.containers || [];
@@ -259,7 +273,7 @@ function renderJobs(jobs) {
   return jobs.slice(0, 12).map((j) => `
     <li data-log="${esc(j.id)}">
       <span class="when">${clock(j.created)}</span>
-      <span class="kind muted">${j.kind === "check" ? "Check" : "Update"}</span>
+      <span class="kind muted">${({ check: "Check", reboot: "Reboot" })[j.kind] || "Update"}</span>
       <span class="what">${esc(j.kind === "check" ? j.host : j.name)} ${j.summary ? `<em>· ${esc(j.summary)}</em>` : ""}</span>
       <span class="pill ${cls[j.status] || ""}">${esc(j.status)}</span>
     </li>`).join("");
@@ -323,7 +337,7 @@ function openLog(jobId, title) {
   if (logSource) logSource.close();
   logJobId = jobId;
   const job = state && state.jobs.find((j) => j.id === jobId);
-  $("#log-title").textContent = title || (job ? `${job.kind === "check" ? "Check" : "Update"} · ${job.kind === "check" ? job.host : job.name}` : "Job");
+  $("#log-title").textContent = title || (job ? `${({ check: "Check", reboot: "Reboot" })[job.kind] || "Update"} · ${job.kind === "check" ? job.host : job.name}` : "Job");
   const status = $("#log-status");
   const setStatus = (s) => { status.textContent = s; status.className = "pill " + ({ success: "ok", failed: "bad", warning: "warn" }[s] || "info running"); };
   setStatus(job ? job.status : "running");

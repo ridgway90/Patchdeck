@@ -162,6 +162,21 @@ be set with the `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` environment variables
 
 Patchdeck needs outbound HTTPS to the registries for this. Turn it off under Settings → General.
 
+## Pending reboots
+
+When you tick "reboot if required" on an update, Patchdeck writes a pending-reboot flag for that host or guest
+**before** anything happens, and keeps it in `data/state.json`, so it survives Patchdeck itself being restarted
+(for example when it runs on the host that reboots first).
+
+- The flag is only cleared when a fresh check shows the target no longer needs a reboot (or the update failed, so
+  there is nothing to reboot for).
+- If it is still set, Patchdeck tries again the next time the target's maintenance window opens, up to **3 times**.
+  It also re-checks on start-up, so a missed reboot is picked up after a restart.
+- After 3 tries it gives up, sends a Discord message and shows "gave up after 3 tries" on the row. Run another
+  update with "reboot if required" to start over.
+- Retries only happen in a maintenance window. With no window configured nothing is retried automatically.
+- A target is not retried within 15 minutes of an attempt, so a reboot that is still in progress isn't repeated.
+
 ## Security notes
 
 - The SSH key gives root on your Proxmox hosts. Keep `data/` private and only expose Patchdeck
